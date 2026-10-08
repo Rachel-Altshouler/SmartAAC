@@ -1,0 +1,5972 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type AacSymbol,
+  type CalendarEvent,
+  type DemoState,
+  type FunctionalityLevel,
+  arasaacImageUrl,
+  getAllCategories,
+  allEmojiChoices,
+  initialState,
+  keshetCategoryOrder,
+  keshetCoreSymbolIds,
+  keshetPreviewCount,
+  quickPhrases,
+  symbols,
+  weeklyTopics,
+  wordTypeColors,
+} from "@/lib/demo-data";
+import { getEventsThisWeek, getWeeklyTopicSentences } from "@/lib/context-engine";
+import { genderWord, localFixSentence } from "@/lib/hebrew-grammar";
+import { SharedLibraryDashboard } from "@/components/shared-library";
+import { ChildDevicePanel, isChildDeviceEnabled, ParentPinModal } from "@/components/child-device";
+import { buildLocalChildAiAnswer } from "@/lib/local-ai";
+import { buildTeacherInviteContent } from "@/lib/teacher-invite";
+import { isSupabaseConfigured, supabase } from "@/lib/supabase-browser";
+import {
+  parseStory,
+  pickLocalStory,
+  STORY_ENDING_LINE,
+  STORY_FEEDBACK,
+  storyStepChoices,
+  storyStepContinuation,
+  storyStepSentence,
+  type Story,
+  type StoryChoice,
+} from "@/lib/story-game";
+
+type ChildView =
+  | { type: "home" }
+  | { type: "category"; categoryId: string }
+  | { type: "keyboard" }
+  | { type: "events" }
+  | { type: "assistant" }
+  | { type: "story" };
+
+const TYPED_TOKEN_PREFIX = "typed:";
+const MAX_TYPED_CHARS = 80;
+
+const hebrewKeyboardRows = [
+  ["ק", "ר", "א", "ט", "ו", "ן", "ם", "פ"],
+  ["ש", "ד", "ג", "כ", "ע", "י", "ח", "ל", "ך", "ף"],
+  ["ז", "ס", "ב", "ה", "נ", "מ", "צ", "ת", "ץ"],
+] as const;
+
+// Dictionary used for live word prediction while typing on the letter keyboard.
+const keyboardWordDictionary = Array.from(new Set(symbols.map((symbol) => symbol.label)));
+
+const getWordPredictions = (prefix: string, limit = 8): string[] => {
+  if (!prefix) return [];
+  return keyboardWordDictionary.filter((word) => word.startsWith(prefix)).slice(0, limit);
+};
+
+const isTypedToken = (token: string): boolean => token.startsWith(TYPED_TOKEN_PREFIX);
+
+const typedTokenLabel = (token: string): string => token.slice(TYPED_TOKEN_PREFIX.length);
+
+const encodeTypedToken = (text: string): string => `${TYPED_TOKEN_PREFIX}${text}`;
+
+const sanitizeTypedText = (value: string): string =>
+  value.replace(/\s+/g, " ").trim().slice(0, MAX_TYPED_CHARS);
+
+const sentenceItemLabel = (
+  token: string,
+  byId: Record<string, AacSymbol>,
+): string => (isTypedToken(token) ? typedTokenLabel(token) : (byId[token]?.label ?? ""));
+
+type DashboardView =
+  | "overview"
+  | "calendar"
+  | "events"
+  | "topic"
+  | "level"
+  | "symbols"
+  | "library"
+  | "progress";
+
+const storageKey = "smartaac-next-demo";
+const imagesStorageKey = "smartaac-next-demo-images";
+
+// API routes answer JSON, but a crash or a dev-server reload mid-request
+// returns an HTML error page — surface that as a readable error instead of
+// "Unexpected token '<' ... is not valid JSON".
+const readJsonResponse = async (response: Response): Promise<unknown> => {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: "השרת לא הגיב כמו שצריך (אולי הוא התעדכן באמצע). נסו שוב בעוד רגע." };
+  }
+};
+
+// The access code this browser last showed — sent on login so the server can
+// keep it instead of issuing (and emailing) a new one every time.
+const readKnownInviteCode = (): string | undefined => {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    return raw ? (JSON.parse(raw) as { teacherInviteCode?: string }).teacherInviteCode : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const authDraftKey = "smartaac-auth-draft";
+const rememberedAuthKey = "smartaac-remembered-auth";
+
+type AccountType = "create" | "join";
+
+type AuthDraft = {
+  mode: "parent" | "teacher";
+  accountType: AccountType;
+  name: string;
+  email: string;
+  childName: string;
+  childAccessCode: string;
+  functionalityLevel: string;
+};
+
+type RecoveredAuth = {
+  email: string;
+  name: string;
+  teacherInviteCode?: string;
+  teacherEmail?: string;
+  isFirstLogin?: boolean;
+  userId: string;
+  childId?: string;
+  childName?: string;
+  linkedChildren?: Array<{ id: string; name: string }>;
+  mode: "parent" | "teacher";
+  accountType: AccountType;
+};
+
+const readAuthDraft = (): AuthDraft => {
+  const raw = window.sessionStorage.getItem(authDraftKey);
+  if (raw) {
+    return JSON.parse(raw) as AuthDraft;
+  }
+  return {
+    mode: "parent",
+    accountType: "create",
+    name: "הורה",
+    email: "",
+    childName: "דניאל",
+    childAccessCode: "",
+    functionalityLevel: "medium",
+  };
+};
+
+const readGoogleNameFromMetadata = (
+  metadata: Record<string, unknown> | undefined,
+): string => {
+  if (!metadata) return "";
+  if (typeof metadata.full_name === "string" && metadata.full_name.trim()) {
+    return metadata.full_name.trim();
+  }
+  if (typeof metadata.name === "string" && metadata.name.trim()) {
+    return metadata.name.trim();
+  }
+  return "";
+};
+
+async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
+  if (!supabase) return null;
+
+  const rawResult = window.sessionStorage.getItem("smartaac-auth-result");
+  if (rawResult) {
+    try {
+      const parsed = JSON.parse(rawResult) as Partial<RecoveredAuth>;
+      window.sessionStorage.removeItem("smartaac-auth-result");
+      if (parsed.userId && parsed.email) {
+        return {
+          email: parsed.email,
+          name: parsed.name ?? "הורה",
+          teacherInviteCode: parsed.teacherInviteCode,
+          teacherEmail: parsed.teacherEmail,
+          isFirstLogin: parsed.isFirstLogin,
+          userId: parsed.userId,
+          childId: parsed.childId,
+          childName: parsed.childName,
+          linkedChildren: parsed.linkedChildren,
+          mode: parsed.mode ?? "parent",
+          accountType: parsed.accountType ?? "create",
+        };
+      }
+    } catch {
+      window.sessionStorage.removeItem("smartaac-auth-result");
+    }
+  }
+
+  const sessionResult = await supabase.auth.getSession();
+  const session = sessionResult.data.session;
+  if (!session) return null;
+
+  const accessToken = session.access_token;
+  const meRes = await fetch("/api/auth/me", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (meRes.ok) {
+    const profile = (await meRes.json()) as {
+      userId?: string;
+      email?: string;
+      name?: string;
+      role?: "parent" | "teacher";
+      accountType?: AccountType;
+      childId?: string;
+      childName?: string;
+      teacherEmail?: string;
+      linkedChildren?: Array<{ id: string; name: string }>;
+    };
+
+    const isTeacher = profile.role === "teacher";
+    const hasChild = Boolean(profile.childId || profile.linkedChildren?.length);
+
+    if (profile.userId && profile.email && hasChild) {
+      return {
+        email: profile.email,
+        name: profile.name ?? (isTeacher ? "מורה" : "הורה"),
+        userId: profile.userId,
+        childId: profile.childId ?? profile.linkedChildren?.[0]?.id,
+        childName: profile.childName ?? profile.linkedChildren?.[0]?.name,
+        teacherEmail: profile.teacherEmail,
+        linkedChildren: profile.linkedChildren,
+        mode: isTeacher ? "teacher" : "parent",
+        accountType: profile.accountType ?? "create",
+      };
+    }
+  }
+
+  const draft = readAuthDraft();
+  const googleEmail = session.user.email ?? draft.email;
+  const googleName =
+    readGoogleNameFromMetadata(session.user.user_metadata) || draft.name;
+
+  const setupRes = await fetch("/api/auth/callback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      accessToken: session.access_token,
+      refreshToken: session.refresh_token,
+      mode: draft.mode,
+      accountType: draft.accountType,
+      name: googleName,
+      email: googleEmail,
+      childName: draft.childName,
+      childAccessCode: draft.childAccessCode,
+      knownInviteCode: readKnownInviteCode(),
+      functionalityLevel: draft.functionalityLevel,
+    }),
+  });
+
+  const payload = (await readJsonResponse(setupRes)) as {
+    userId?: string;
+    email?: string;
+    name?: string;
+    teacherInviteCode?: string;
+    teacherEmail?: string;
+    isFirstLogin?: boolean;
+    childId?: string;
+    childName?: string;
+    linkedChildren?: Array<{ id: string; name: string }>;
+    session?: { access_token: string; refresh_token: string };
+  };
+
+  if (!setupRes.ok || !payload.userId) {
+    return null;
+  }
+
+  await supabase.auth.setSession({
+    access_token: payload.session?.access_token ?? session.access_token,
+    refresh_token: payload.session?.refresh_token ?? session.refresh_token,
+  });
+
+  window.sessionStorage.removeItem(authDraftKey);
+
+  return {
+    email: payload.email ?? googleEmail,
+    name: payload.name ?? googleName,
+    teacherInviteCode: payload.teacherInviteCode,
+    teacherEmail: payload.teacherEmail,
+    isFirstLogin: payload.isFirstLogin,
+    userId: payload.userId,
+    childId: payload.childId,
+    childName: payload.childName,
+    linkedChildren: payload.linkedChildren,
+    mode: draft.mode,
+    accountType: draft.accountType,
+  };
+}
+
+const applyRecoveredAuthToState = (
+  recovered: RecoveredAuth,
+  updateStateFn: (updater: (current: DemoState) => DemoState) => void,
+  setSavedSessionFn: (session: { name: string; email: string; role: "parent" | "teacher" }) => void,
+  setTeacherEmailFn: (email: string) => void,
+): void => {
+  const role: "parent" | "teacher" = recovered.mode === "teacher" ? "teacher" : "parent";
+
+  setSavedSessionFn({
+    name: recovered.name,
+    email: recovered.email,
+    role,
+  });
+
+  if (recovered.accountType === "join") {
+    updateStateFn((current) => ({
+      ...current,
+      dashboardRole: role,
+      isProfileCreator: false,
+      connectedTeacherEmail: recovered.email,
+      parentEmail: current.parentEmail || recovered.email,
+      activeChildName: recovered.childName ?? current.activeChildName,
+      linkedChildren: recovered.linkedChildren ?? current.linkedChildren,
+      isRegisteredInSupabase: true,
+      supabaseUserId: recovered.userId,
+      supabaseChildId: recovered.childId ?? current.supabaseChildId,
+    }));
+    return;
+  }
+
+  updateStateFn((current) => ({
+    ...current,
+    dashboardRole: role,
+    isProfileCreator: true,
+    parentEmail: recovered.email,
+    parentName: recovered.name,
+    activeChildName: recovered.childName ?? current.activeChildName,
+    teacherInviteCode: recovered.teacherInviteCode ?? current.teacherInviteCode,
+    connectedTeacherEmail: recovered.teacherEmail ?? current.connectedTeacherEmail,
+    pendingTeacherInvite: recovered.isFirstLogin ? true : current.pendingTeacherInvite,
+    isRegisteredInSupabase: true,
+    supabaseUserId: recovered.userId,
+    supabaseChildId: recovered.childId,
+  }));
+
+  if (recovered.teacherEmail) {
+    setTeacherEmailFn(recovered.teacherEmail);
+  }
+};
+
+const eventLabels: Record<CalendarEvent["type"], { label: string; emoji: string }> = {
+  trip: { label: "טיול", emoji: "🚌" },
+  birthday: { label: "יום הולדת", emoji: "🎂" },
+  school: { label: "פעילות בכיתה", emoji: "🏫" },
+  family: { label: "מפגש משפחתי", emoji: "👪" },
+  special: { label: "פעילות מיוחדת", emoji: "⭐" },
+};
+
+const levelLabels: Record<FunctionalityLevel, string> = {
+  low: "נמוכה",
+  medium: "בינונית",
+  high: "גבוהה",
+};
+
+const today = (): string => new Date().toISOString().slice(0, 10);
+
+const cx = (...classes: Array<string | false | undefined>): string =>
+  classes.filter(Boolean).join(" ");
+
+const resolveSymbolImage = (
+  symbol: AacSymbol,
+  symbolImages: Record<string, string>,
+): string | undefined => symbol.imageUrl ?? symbolImages[symbol.id];
+
+const MAX_FAMILY_PHOTO_BYTES = 8 * 1024 * 1024;
+
+const readImageFileAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("לא הצלחנו לקרוא את התמונה."));
+    };
+    reader.onerror = () => reject(new Error("לא הצלחנו לקרוא את התמונה."));
+    reader.readAsDataURL(file);
+  });
+
+const compressFamilyPhoto = async (file: File): Promise<string> => {
+  const bitmap = await createImageBitmap(file);
+  const maxSize = 640;
+  const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
+  const width = Math.max(1, Math.round(bitmap.width * scale));
+  const height = Math.max(1, Math.round(bitmap.height * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error("לא הצלחנו לעבד את התמונה.");
+  }
+
+  context.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+
+  const compressed = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+          return;
+        }
+        reject(new Error("לא הצלחנו לדחוס את התמונה."));
+      },
+      "image/jpeg",
+      0.82,
+    );
+  });
+
+  return readImageFileAsDataUrl(new File([compressed], "family-photo.jpg", { type: "image/jpeg" }));
+};
+
+const prepareFamilyPhoto = async (file: File): Promise<string> => {
+  if (file.size <= 400_000) {
+    return readImageFileAsDataUrl(file);
+  }
+  return compressFamilyPhoto(file);
+};
+
+// Voices read emoji aloud by name ("🎉" → "אביזר מסיבות"), so strip them —
+// they're only there for the eye.
+const stripEmoji = (text: string): string =>
+  text
+    .replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const speakHebrew = (rawText: string, rate = 0.9, onEnd?: () => void): void => {
+  const text = stripEmoji(rawText);
+  if (!("speechSynthesis" in window) || !text) {
+    onEnd?.();
+    return;
+  }
+
+  const synth = window.speechSynthesis;
+  synth.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "he-IL";
+  utterance.rate = rate;
+  if (onEnd) {
+    utterance.addEventListener("end", onEnd, { once: true });
+    utterance.addEventListener("error", onEnd, { once: true });
+  }
+
+  const assignVoice = (): void => {
+    const voices = synth.getVoices();
+    const hebrewVoices = voices.filter(
+      (voice) =>
+        voice.lang.startsWith("he") ||
+        voice.lang.startsWith("iw") ||
+        voice.name.toLowerCase().includes("hebrew"),
+    );
+    // Prefer a voice installed on the device: remote/network voices (e.g. Chrome's
+    // default "Google עברית") commonly ignore the `rate` we set below.
+    const hebrewVoice =
+      hebrewVoices.find((voice) => voice.localService) ?? hebrewVoices[0];
+    if (hebrewVoice) {
+      utterance.voice = hebrewVoice;
+    }
+  };
+
+  const speakNow = (): void => {
+    if (spoken) return;
+    spoken = true;
+    assignVoice();
+    synth.speak(utterance);
+  };
+
+  let spoken = false;
+
+  if (synth.getVoices().length === 0) {
+    synth.addEventListener("voiceschanged", speakNow, { once: true });
+    window.setTimeout(speakNow, 300);
+    return;
+  }
+
+  speakNow();
+};
+
+const isOpenAiQuotaError = (message?: string): boolean => {
+  const text = (message ?? "").toLowerCase();
+  return text.includes("insufficient_quota") || text.includes("exceeded your current quota");
+};
+
+const openAiQuotaMessage =
+  "נגמרה המכסה של OpenAI. הוסיפ/י GEMINI_API_KEY (חינם) ל-.env.local מ-aistudio.google.com";
+
+const aiApiErrorMessage = (error?: string, detail?: string): string => {
+  const combined = `${error ?? ""} ${detail ?? ""}`.toLowerCase();
+  if (isOpenAiQuotaError(combined)) return openAiQuotaMessage;
+  if (combined.includes("network filter") || combined.includes("invalid response")) {
+    return "Groq/Gemini חסומים ברשת. התקינ/י Ollama מקומי: ollama pull llama3.2";
+  }
+  if (error === "GROQ_API_KEY is not configured") {
+    return "חסר GROQ_API_KEY. קבל/י מפתח חינם ב-console.groq.com/keys";
+  }
+  if (error === "GEMINI_API_KEY is not configured") {
+    return "חסר GEMINI_API_KEY. קבל/י מפתח חינם ב-aistudio.google.com/apikey";
+  }
+  if (combined.includes("api key not valid") || combined.includes("invalid api key")) {
+    return "מפתח GEMINI_API_KEY לא תקין. קבל/י מפתח חדש ב-aistudio.google.com/apikey ורעננ/י את השרת.";
+  }
+  if (combined.includes("quota") || combined.includes("rate limit") || combined.includes("resource exhausted")) {
+    return "נגמרה מכסת Gemini (חינם). נס/י: מפתח חדש ב-aistudio.google.com/apikey, GEMINI_MODEL=gemini-2.0-flash-lite, או כתיבת המשפט במקום דיבור.";
+  }
+  if (error === "gemini transcription failed" || combined.includes("gemini")) {
+    return `שגיאת Gemini: ${detail?.trim() || error?.trim() || "בדק/י GEMINI_API_KEY ו-GEMINI_MODEL ב-.env.local"}`;
+  }
+  return "";
+};
+
+const speechApiErrorMessage = (error?: string, detail?: string): string => {
+  const aiMessage = aiApiErrorMessage(error, detail);
+  if (aiMessage) return aiMessage;
+  const combined = `${error ?? ""} ${detail ?? ""}`;
+  if (error === "OPENAI_API_KEY is not configured") {
+    return "חסר מפתח AI. הוסיפ/י GEMINI_API_KEY (חינם) ל-.env.local";
+  }
+  if (error === "local speech unavailable" || detail?.includes("gemma4")) {
+    return "דיבור מקומי דורש Ollama + מודל gemma4:e4b. הריצ/י: ollama pull gemma4:e4b";
+  }
+  if (error === "ollama whisper model not available") {
+    return "חסר מודל דיבור ב-Ollama. הריצ/י: ollama pull gemma4:e4b";
+  }
+  if (error === "empty transcript") {
+    return "לא שמעתי מילים. דבר/י קרוב למיקרופון ונס/י שוב.";
+  }
+  return "לא הצלחתי להבין את הדיבור. נס/י שוב, או כתב/י את המשפט.";
+};
+
+const audioExtensionForMime = (mimeType: string): string => {
+  if (mimeType.includes("mp4")) return "mp4";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("wav")) return "wav";
+  return "webm";
+};
+
+const SPEECH_SAMPLE_RATE = 44100;
+const MIN_RECORDING_MS = 700;
+
+const getSpeechRecognition = (): SpeechRecognitionInstance | null => {
+  if (typeof window === "undefined") return null;
+  const SpeechRecognitionCtor =
+    window.SpeechRecognition ?? window.webkitSpeechRecognition;
+  if (!SpeechRecognitionCtor) return null;
+
+  const recognition = new SpeechRecognitionCtor();
+  recognition.lang = "he-IL";
+  recognition.continuous = false;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 3;
+  return recognition;
+};
+
+const pickBestTranscript = (results: SpeechRecognitionResultList): string => {
+  let best = "";
+  let bestConfidence = -1;
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    if (!result.isFinal && i < results.length - 1) continue;
+
+    for (let j = 0; j < result.length; j++) {
+      const alternative = result[j];
+      if (alternative.confidence >= bestConfidence) {
+        bestConfidence = alternative.confidence;
+        best = alternative.transcript;
+      }
+    }
+  }
+
+  if (best.trim()) return best.trim();
+
+  let fallback = "";
+  for (let i = 0; i < results.length; i++) {
+    fallback += results[i][0]?.transcript ?? "";
+  }
+  return fallback.trim();
+};
+
+const normalizeAudio = (samples: Float32Array): Float32Array => {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    peak = Math.max(peak, Math.abs(samples[i]));
+  }
+  if (peak < 0.02) return samples;
+
+  const gain = Math.min(0.95 / peak, 4);
+  const normalized = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    normalized[i] = Math.max(-1, Math.min(1, samples[i] * gain));
+  }
+  return normalized;
+};
+
+const resampleMono = (
+  samples: Float32Array,
+  sourceRate: number,
+  targetRate: number,
+): Float32Array => {
+  if (sourceRate === targetRate) return samples;
+
+  const ratio = sourceRate / targetRate;
+  const newLength = Math.round(samples.length / ratio);
+  const result = new Float32Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const position = i * ratio;
+    const index = Math.floor(position);
+    const next = Math.min(index + 1, samples.length - 1);
+    const weight = position - index;
+    result[i] = samples[index] * (1 - weight) + samples[next] * weight;
+  }
+
+  return result;
+};
+
+const encodeWavBlob = (samples: Float32Array, sampleRate: number): Blob => {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, value: string): void => {
+    for (let i = 0; i < value.length; i++) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+};
+
+const recordingToWavBlob = async (blob: Blob): Promise<Blob> => {
+  const audioContext = new AudioContext();
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const mono = new Float32Array(audioBuffer.length);
+
+    for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+      const channelData = audioBuffer.getChannelData(channel);
+      for (let i = 0; i < audioBuffer.length; i++) {
+        mono[i] += channelData[i] / audioBuffer.numberOfChannels;
+      }
+    }
+
+    const resampled = resampleMono(mono, audioBuffer.sampleRate, SPEECH_SAMPLE_RATE);
+    const normalized = normalizeAudio(resampled);
+    return encodeWavBlob(normalized, SPEECH_SAMPLE_RATE);
+  } finally {
+    await audioContext.close();
+  }
+};
+
+type AuthMode = "parent" | "teacher";
+
+type ChildAiResponse = {
+  answer?: string;
+  note?: string;
+  error?: string;
+  provider?: string;
+};
+
+type AiChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
+
+const createLocalId = (prefix: string): string => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+};
+
+const firstGrapheme = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+    const segmenter = new Intl.Segmenter("he", { granularity: "grapheme" });
+    const first = [...segmenter.segment(trimmed)][0];
+    return first?.segment ?? trimmed;
+  }
+
+  return Array.from(trimmed)[0] ?? trimmed;
+};
+
+function EmojiPickerField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const filteredChoices = useMemo(() => {
+    const query = search.trim();
+    if (!query) return allEmojiChoices;
+    return allEmojiChoices.filter((emoji) => emoji.includes(query));
+  }, [search]);
+
+  const openSystemPicker = (): void => {
+    inputRef.current?.focus();
+    const input = inputRef.current;
+    if (input && "showPicker" in input) {
+      // showPicker() returns void in current DOM typings and throws (rather
+      // than rejecting) when the picker can't open.
+      try {
+        input.showPicker();
+      } catch {
+        // focusing the input above is enough
+      }
+    }
+  };
+
+  return (
+    <div>
+      <label className="mb-2 block text-sm font-black text-slate-700">{label}</label>
+      <div className="rounded-2xl border border-slate-200 bg-white p-3">
+        <div className="mb-3 flex min-h-14 items-center justify-center rounded-xl bg-slate-50 text-4xl">
+          {value || "⭐"}
+        </div>
+        <div className="mb-3 flex flex-wrap gap-2">
+          <input
+            ref={inputRef}
+            className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-center text-sm"
+            value={value}
+            onChange={(event) => onChange(firstGrapheme(event.target.value))}
+            placeholder="הדביק/י אימוג׳י או הקליד/י"
+            aria-label={label}
+          />
+          <button
+            type="button"
+            className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-black"
+            onClick={openSystemPicker}
+          >
+            בורר מערכת
+          </button>
+        </div>
+        <input
+          className="mb-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="חיפוש באימוג׳ים..."
+        />
+        <div className="max-h-56 overflow-y-auto rounded-xl border border-slate-100 bg-slate-50 p-2">
+          <div className="flex flex-wrap gap-1.5">
+            {filteredChoices.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                className={cx(
+                  "rounded-lg border px-2 py-1.5 text-xl transition",
+                  value === emoji
+                    ? "border-blue-500 bg-blue-50 ring-2 ring-blue-200"
+                    : "border-slate-200 bg-white hover:bg-slate-100",
+                )}
+                onClick={() => onChange(emoji)}
+                aria-label={`בחר ${emoji}`}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+          {filteredChoices.length === 0 && (
+            <p className="p-3 text-center text-sm text-muted">לא נמצאו אימוג׳ים. נסו להדביק ידנית למעלה.</p>
+          )}
+        </div>
+        <p className="mt-2 text-xs text-muted">
+          {allEmojiChoices.length} אימוג׳ים · Windows: Win+. · Mac: Ctrl+Cmd+Space
+        </p>
+      </div>
+    </div>
+  );
+}
+
+const createTeacherInviteCode = (): string =>
+  `AAC-${Math.floor(1000 + Math.random() * 9000)}`;
+
+const getErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : "אירעה שגיאה. נסו שוב.";
+
+const normalizeEmail = (value: string): string =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, "");
+
+const isValidEmail = (value: string): boolean =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(value));
+
+const resolveAuthFields = (
+  name: string,
+  email: string,
+): { name: string; email: string; swapped: boolean } => {
+  const trimmedName = name.trim();
+  const normalizedEmail = normalizeEmail(email);
+
+  if (isValidEmail(normalizedEmail)) {
+    return { name: trimmedName, email: normalizedEmail, swapped: false };
+  }
+
+  const normalizedNameAsEmail = normalizeEmail(trimmedName);
+  if (isValidEmail(normalizedNameAsEmail) && trimmedName.includes("@")) {
+    return {
+      name: normalizedEmail || trimmedName,
+      email: normalizedNameAsEmail,
+      swapped: true,
+    };
+  }
+
+  return { name: trimmedName, email: normalizedEmail, swapped: false };
+};
+
+const translateAuthError = (message: string): string => {
+  const lower = message.toLowerCase();
+
+  if (lower.includes("invalid format") || lower.includes("unable to validate email")) {
+    return "פורמט אימייל לא תקין. כתב/י כתובת אימייל תקינה, באותיות לועזיות ובלי רווחים.";
+  }
+
+  if (lower.includes("rate limit")) {
+    return "יותר מדי ניסיונות הרשמה. המתינו כמה דקות, או כבו Confirm email ב-Supabase → Authentication → Email.";
+  }
+  if (lower.includes("invalid login credentials") || lower.includes("invalid credentials")) {
+    return "הסיסמה שגויה, או שהאימייל לא מאושר. ב-Supabase: Users → בחר/י משתמש → Send password recovery.";
+  }
+  if (lower.includes("user already registered") || lower.includes("already been registered")) {
+    return "האימייל כבר רשום. התחברו עם אותו אימייל וסיסמה.";
+  }
+  if (lower.includes("email not confirmed")) {
+    return "האימייל לא מאושר. הוסיפ/י SUPABASE_SERVICE_ROLE_KEY ל-.env.local, או כבו Confirm email ב-Supabase → Authentication → Email.";
+  }
+  if (lower.includes("supabase_service_role_key")) {
+    return message;
+  }
+  if (lower.includes("not authenticated")) {
+    return "ההתחברות לא הושלמה. נסו שוב, או כבו Confirm email ב-Supabase → Authentication → Email.";
+  }
+  if (lower.includes("failed to fetch")) {
+    return "לא הצלחנו להתחבר לשרת. בדקו אינטרנט ורעננו את הדף.";
+  }
+  if (lower.includes("children_parent_id_fkey") || lower.includes("foreign key constraint")) {
+    return "פרופיל ההורה לא נוצר ב-Supabase. ודא/י ש-SUPABASE_SERVICE_ROLE_KEY מוגדר, והריצ/י שוב את supabase/schema.sql.";
+  }
+  if (lower.includes("get_or_create_parent_child") || lower.includes("schema cache")) {
+    return "חסרה פונקציה ב-Supabase. הריצו שוב את supabase/schema.sql ב-SQL Editor ואז רעננו.";
+  }
+  if (lower.includes("invalid child access code")) {
+    return "קוד הילד שגוי. בקשי מההורה קוד חדש מלוח הבקרה → צור קוד חדש למורה.";
+  }
+  if (lower.includes("gen_salt") || lower.includes("function crypt")) {
+    return "עדכנו את הקוד. הפעילי מחדש npm run dev, ההורה יוצרת קוד חדש, והמורה מתחברת עם הקוד החדש.";
+  }
+  if (lower.includes("unsupported provider")) {
+    return "Google לא מופעל ב-Supabase. השתמשו באימייל וסיסמה.";
+  }
+
+  return message;
+};
+
+const daysFromToday = (dateValue: string): number => {
+  const current = new Date(today());
+  const target = new Date(dateValue);
+  return Math.round((target.getTime() - current.getTime()) / 86_400_000);
+};
+
+const getEventPrompts = (event: CalendarEvent): string[] => {
+  const distance = daysFromToday(event.date);
+  const title = event.title;
+
+  if (distance > 0) {
+    if (event.type === "trip") {
+      return [`יש לי טיול: ${title}`, "אני רוצה לדעת לאן נוסעים", "אני צריך להכין תיק", "אני מתרגש מהטיול"];
+    }
+    if (event.type === "birthday") {
+      return [`יש יום הולדת: ${title}`, "אני רוצה לברך מזל טוב", "אני רוצה לשיר שיר", "אני רוצה עוגה"];
+    }
+    if (event.type === "school") {
+      return [`יש פעילות בכיתה: ${title}`, "מה נעשה בפעילות?", "מי יהיה איתי?", "אני צריך עזרה להתכונן"];
+    }
+    if (event.type === "family") {
+      return [`יש מפגש משפחתי: ${title}`, "מי מגיע לבקר?", "אני רוצה להגיד שלום", "אני רוצה לשבת ליד המשפחה"];
+    }
+    return [`יש אירוע מיוחד: ${title}`, "מה הולך לקרות?", "אני רוצה להתכונן", "אני רוצה שמישהו יסביר לי"];
+  }
+
+  if (distance === 0) {
+    if (event.type === "trip") return ["הטיול היום", "אני רוצה ללכת לטיול", "אני צריך עזרה", "אני רוצה לספר איך אני מרגיש"];
+    if (event.type === "birthday") return ["יום ההולדת היום", "מזל טוב", "אני רוצה להשתתף", "אני רוצה הפסקה"];
+    if (event.type === "school") return ["הפעילות היום", "אני רוצה להשתתף", "אני צריך הסבר", "אני רוצה לשאול שאלה"];
+    if (event.type === "family") return ["המפגש היום", "אני רוצה להגיד שלום", "אני רוצה לשחק", "אני צריך מקום שקט"];
+    return ["האירוע היום", "אני רוצה לדעת מה עושים", "אני צריך עזרה", "אני רוצה לספר"];
+  }
+
+  if (event.type === "trip") return ["איך היה בטיול?", "נהניתי בטיול", "היה לי קשה בטיול", "אני רוצה לספר מה ראיתי"];
+  if (event.type === "birthday") return ["איך היה ביום ההולדת?", "היה לי כיף", "בירכתי מזל טוב", "אני רוצה לספר מה אכלתי"];
+  if (event.type === "school") return ["מה עשינו בכיתה?", "השתתפתי בפעילות", "היה לי קל", "היה לי קשה"];
+  if (event.type === "family") return ["איך היה עם המשפחה?", "היה לי נעים", "רציתי לשחק", "רציתי לנוח"];
+  return ["איך היה באירוע?", "זה היה מיוחד", "אני רוצה לספר", "אני רוצה לשאול שאלה"];
+};
+
+export function SmartAACDemo() {
+  const [state, setState] = useState<DemoState>(initialState);
+  // False until the saved state has been read from localStorage. Saving before
+  // that would write the empty initialState over the user's data — and in
+  // React dev/StrictMode the load effect runs twice, so the second read would
+  // then see that empty state and wipe photos, custom categories and settings.
+  const [hasLoadedStoredState, setHasLoadedStoredState] = useState(false);
+  const [sentence, setSentence] = useState<string[]>([]);
+  // The AI-corrected version of `sentence`, keyed by the words it was made
+  // from so a stale answer is never read aloud for a different sentence.
+  const [fixedSentence, setFixedSentence] = useState<{ key: string; text: string } | null>(null);
+  const [isFixingSentence, setIsFixingSentence] = useState(false);
+  const [childView, setChildView] = useState<ChildView>({ type: "home" });
+  const [isEntryOpen, setIsEntryOpen] = useState(true);
+  const [isDashboardOpen, setIsDashboardOpen] = useState(false);
+  // "מכשיר של ילד": this device opens straight to the board, and the hidden
+  // corner asks for the parent PIN instead of the full login.
+  const [isChildDevice, setIsChildDevice] = useState(false);
+  const [isParentPinOpen, setIsParentPinOpen] = useState(false);
+  const [dashboardView, setDashboardView] = useState<DashboardView>("overview");
+  const [isLoginOpen, setIsLoginOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [parentName, setParentName] = useState("");
+  const [parentEmail, setParentEmail] = useState("");
+  const [authMode, setAuthMode] = useState<AuthMode>("parent");
+  const [authAccountType, setAuthAccountType] = useState<AccountType>("create");
+  const [childName, setChildName] = useState("דניאל");
+  const [childAccessCode, setChildAccessCode] = useState("");
+  const [teacherEmail, setTeacherEmail] = useState("");
+  const [inviteMessage, setInviteMessage] = useState("");
+  const [rememberMe, setRememberMe] = useState(true);
+  const [savedSession, setSavedSession] = useState<{
+    name: string;
+    email: string;
+    role: "parent" | "teacher";
+  } | null>(null);
+  const [authMessage, setAuthMessage] = useState("");
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [tapCount, setTapCount] = useState(0);
+
+  // Supabase sync: child-scoped data (events, weekly topic, symbol settings,
+  // family photos, usage stats) that used to live only in localStorage.
+  // syncedChildIdRef ensures the initial pull-or-push-on-login effect runs
+  // once per login per child. The five skip*SyncRef flags suppress a single
+  // echo of a debounced sync effect right after its own data was just written
+  // by the login reconcile (or, for events, by adopting server-issued ids) —
+  // without them each sync would immediately re-fire and re-post the data it
+  // just received.
+  const syncedChildIdRef = useRef<string | null>(null);
+  const initialSyncDoneRef = useRef(false);
+  const skipEventsSyncRef = useRef(false);
+  const skipTopicSyncRef = useRef(false);
+  const skipSymbolSettingsSyncRef = useRef(false);
+  const skipSymbolImagesSyncRef = useRef(false);
+  const skipUsageStatsSyncRef = useRef(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const mode = params.get("mode");
+    const code = params.get("code");
+    if (code) {
+      // An invite link always means "join with this code" — the invitee
+      // still picks their own role (parent/teacher) label in the form.
+      setAuthAccountType("join");
+      if (mode === "parent" || mode === "teacher") {
+        setAuthMode(mode);
+      }
+      setIsLoginOpen(true);
+      setChildAccessCode(code);
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(storageKey);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<DemoState>;
+      // Images live in their own storage slot (see the save effect below) so a
+      // large photo library never blocks the rest of the app state from saving.
+      // parsed.symbolImages is only read here as a fallback for data saved
+      // before that split existed.
+      let storedImages: Record<string, string> = {};
+      try {
+        const rawImages = window.localStorage.getItem(imagesStorageKey);
+        if (rawImages) {
+          const parsedImages = JSON.parse(rawImages) as Record<string, unknown>;
+          storedImages =
+            "symbolImages" in parsedImages
+              ? (parsedImages.symbolImages as Record<string, string>) ?? {}
+              : (parsedImages as Record<string, string>);
+        }
+      } catch {
+        // corrupted images blob — fall back to whatever was in the main blob
+      }
+
+      setState({
+        ...initialState,
+        ...parsed,
+        categoryUsageById: parsed.categoryUsageById ?? {},
+        customSymbols: parsed.customSymbols ?? [],
+        customCategories: parsed.customCategories ?? [],
+        symbolImages:
+          Object.keys(storedImages).length > 0 ? storedImages : parsed.symbolImages ?? {},
+        symbolLabelOverrides: parsed.symbolLabelOverrides ?? {},
+        coreSymbolIds: parsed.coreSymbolIds
+          ? [...new Set([...initialState.coreSymbolIds, ...parsed.coreSymbolIds])]
+          : initialState.coreSymbolIds,
+        // The new "colors" category should show up for existing saved
+        // profiles too, not just brand-new ones — but only add that specific
+        // category, so a category someone deliberately disabled stays off.
+        enabledCategoryIds:
+          parsed.enabledCategoryIds && !parsed.enabledCategoryIds.includes("colors")
+            ? [...parsed.enabledCategoryIds, "colors"]
+            : (parsed.enabledCategoryIds ?? initialState.enabledCategoryIds),
+        parentEmail: parsed.parentEmail ?? "",
+        parentName: parsed.parentName ?? "",
+        teacherInviteCode: parsed.teacherInviteCode ?? createTeacherInviteCode(),
+        connectedTeacherEmail: parsed.connectedTeacherEmail ?? "",
+        pendingTeacherInvite: parsed.pendingTeacherInvite ?? false,
+        activeChildName: parsed.activeChildName ?? "דניאל",
+        linkedChildren: parsed.linkedChildren ?? [],
+        topicUsageById: parsed.topicUsageById ?? {},
+        // Profiles saved before this flag existed: only parents could create.
+        isProfileCreator: parsed.isProfileCreator ?? parsed.dashboardRole !== "teacher",
+      });
+    }
+    setHasLoadedStoredState(true);
+    if (isChildDeviceEnabled()) {
+      setIsChildDevice(true);
+      setIsEntryOpen(false);
+    }
+    const rememberedRaw = window.localStorage.getItem(rememberedAuthKey);
+    if (rememberedRaw) {
+      const remembered = JSON.parse(rememberedRaw) as {
+        email?: string;
+        name?: string;
+        rememberMe?: boolean;
+      };
+      if (remembered.rememberMe !== false && remembered.email) {
+        setParentEmail(remembered.email);
+        setRememberMe(true);
+      }
+      if (remembered.name) {
+        setParentName(remembered.name);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client || !isSupabaseConfigured) return;
+
+    const restoreSession = async (): Promise<void> => {
+      const sessionResult = await client.auth.getSession();
+      const accessToken = sessionResult.data.session?.access_token;
+      if (!accessToken) return;
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("auth") === "success") return;
+
+      const recovered = await recoverOAuthAuthResult();
+      if (recovered) {
+        applyRecoveredAuthToState(recovered, updateState, setSavedSession, setTeacherEmail);
+      }
+    };
+
+    void restoreSession();
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedStoredState) return;
+    // Images are saved to their own storage slot so a full photo library can
+    // never push the (frequently-changing) rest of the app state over the
+    // localStorage quota and silently stop it from saving.
+    const { symbolImages, ...stateWithoutImages } = state;
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(stateWithoutImages));
+    } catch (error) {
+      console.warn("smartaac: failed to save app state to localStorage", error);
+    }
+    try {
+      window.localStorage.setItem(imagesStorageKey, JSON.stringify({ symbolImages }));
+    } catch (error) {
+      console.warn("smartaac: failed to save family photos to localStorage", error);
+    }
+  }, [state, hasLoadedStoredState]);
+
+  useEffect(() => {
+    if (tapCount === 0) return;
+
+    const timeout = window.setTimeout(() => setTapCount(0), 900);
+    return () => window.clearTimeout(timeout);
+  }, [tapCount]);
+
+  const getSupabaseAccessToken = async (): Promise<string | null> => {
+    if (!supabase) return null;
+    const session = await supabase.auth.getSession();
+    return session.data.session?.access_token ?? null;
+  };
+
+  const postChildData = async (payload: Record<string, unknown>): Promise<void> => {
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+    const token = await getSupabaseAccessToken();
+    if (!token) return;
+    try {
+      const response = await fetch("/api/child-data", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ childId: state.supabaseChildId, ...payload }),
+      });
+      if (!response.ok) {
+        const { error } = (await response.json().catch(() => ({}))) as { error?: string };
+        console.warn("smartaac: Supabase sync rejected", response.status, error);
+      }
+    } catch (error) {
+      console.warn("smartaac: failed to sync to Supabase", error);
+    }
+  };
+
+  // One-time, per login/child: pull saved data down from Supabase (server wins,
+  // since it's the shared source of truth for the account), or — the first time
+  // this child has ever synced — push the current local snapshot up as the
+  // starting point.
+  useEffect(() => {
+    if (!supabase || !isSupabaseConfigured) return;
+    if (!state.isRegisteredInSupabase || !state.supabaseChildId) return;
+    if (syncedChildIdRef.current === state.supabaseChildId) return;
+    syncedChildIdRef.current = state.supabaseChildId;
+
+    const childId = state.supabaseChildId;
+
+    void (async () => {
+      const token = await getSupabaseAccessToken();
+      if (!token) {
+        initialSyncDoneRef.current = true;
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/child-data?childId=${childId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const payload = (await response.json()) as {
+          events?: CalendarEvent[];
+          weeklyTopicId?: string | null;
+          symbolSettings?: Partial<DemoState>;
+          symbolImages?: Record<string, string>;
+          usageStats?: Partial<DemoState>;
+          hasSyncedBefore?: boolean;
+        };
+
+        if (!response.ok) {
+          console.warn("smartaac: failed to load synced data from Supabase", response.status, payload);
+          initialSyncDoneRef.current = true;
+          return;
+        }
+
+        if (payload.hasSyncedBefore) {
+          // An empty photo set on the server must not wipe photos that only
+          // exist locally (e.g. uploaded while a sync was failing) — keep the
+          // local ones and let the images sync effect push them up.
+          const serverImages = payload.symbolImages ?? {};
+          const keepLocalImages =
+            Object.keys(serverImages).length === 0 && Object.keys(state.symbolImages).length > 0;
+
+          skipEventsSyncRef.current = true;
+          // weeklyTopicId is a string: if the server's value equals the local
+          // one the sync effect never fires, and a lingering skip flag would
+          // swallow the user's next real topic change.
+          skipTopicSyncRef.current = Boolean(
+            payload.weeklyTopicId && payload.weeklyTopicId !== state.weeklyTopicId,
+          );
+          skipSymbolSettingsSyncRef.current = true;
+          skipSymbolImagesSyncRef.current = !keepLocalImages;
+          skipUsageStatsSyncRef.current = true;
+
+          setState((current) => ({
+            ...current,
+            events: payload.events ?? current.events,
+            weeklyTopicId: payload.weeklyTopicId || current.weeklyTopicId,
+            hiddenSymbolIds: payload.symbolSettings?.hiddenSymbolIds ?? current.hiddenSymbolIds,
+            favoriteSymbolIds: payload.symbolSettings?.favoriteSymbolIds ?? current.favoriteSymbolIds,
+            coreSymbolIds: payload.symbolSettings?.coreSymbolIds ?? current.coreSymbolIds,
+            enabledCategoryIds:
+              payload.symbolSettings?.enabledCategoryIds ?? current.enabledCategoryIds,
+            customSymbols: payload.symbolSettings?.customSymbols ?? current.customSymbols,
+            customCategories: payload.symbolSettings?.customCategories ?? current.customCategories,
+            symbolLabelOverrides:
+              payload.symbolSettings?.symbolLabelOverrides ?? current.symbolLabelOverrides,
+            childGender: payload.symbolSettings?.childGender ?? current.childGender,
+            smartGrammar: payload.symbolSettings?.smartGrammar ?? current.smartGrammar,
+            symbolImages: keepLocalImages ? { ...current.symbolImages } : serverImages,
+            usageBySymbolId: payload.usageStats?.usageBySymbolId ?? current.usageBySymbolId,
+            categoryUsageById: payload.usageStats?.categoryUsageById ?? current.categoryUsageById,
+            topicUsageById: payload.usageStats?.topicUsageById ?? current.topicUsageById,
+            sentenceCount: payload.usageStats?.sentenceCount ?? current.sentenceCount,
+            sentenceLengths: payload.usageStats?.sentenceLengths ?? current.sentenceLengths,
+          }));
+
+          initialSyncDoneRef.current = true;
+        } else {
+          initialSyncDoneRef.current = true;
+          void postChildData({
+            events: state.events,
+            weeklyTopic: {
+              id: state.weeklyTopicId,
+              label:
+                weeklyTopics.find((topic) => topic.id === state.weeklyTopicId)?.label ??
+                state.weeklyTopicId,
+            },
+            symbolSettings: {
+              hiddenSymbolIds: state.hiddenSymbolIds,
+              favoriteSymbolIds: state.favoriteSymbolIds,
+              coreSymbolIds: state.coreSymbolIds,
+              enabledCategoryIds: state.enabledCategoryIds,
+              customSymbols: state.customSymbols,
+              customCategories: state.customCategories,
+              symbolLabelOverrides: state.symbolLabelOverrides,
+              childGender: state.childGender,
+              smartGrammar: state.smartGrammar,
+            },
+            symbolImages: state.symbolImages,
+            usageStats: {
+              usageBySymbolId: state.usageBySymbolId,
+              categoryUsageById: state.categoryUsageById,
+              topicUsageById: state.topicUsageById,
+              sentenceCount: state.sentenceCount,
+              sentenceLengths: state.sentenceLengths,
+            },
+          });
+        }
+      } catch (error) {
+        console.warn("smartaac: failed to load synced data from Supabase", error);
+        initialSyncDoneRef.current = true;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.isRegisteredInSupabase, state.supabaseChildId]);
+
+  // Debounced sync: calendar events. Full delete+reinsert on the server (see
+  // app/api/child-data/route.ts), so the server always returns freshly-issued
+  // ids — adopt them locally (via the skip ref) so local state converges on
+  // the server's ids instead of looping.
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    if (skipEventsSyncRef.current) {
+      skipEventsSyncRef.current = false;
+      return;
+    }
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+
+    const childId = state.supabaseChildId;
+    const events = state.events;
+
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        const token = await getSupabaseAccessToken();
+        if (!token) return;
+        try {
+          const response = await fetch("/api/child-data", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ childId, events }),
+          });
+          const payload = (await response.json()) as { events?: CalendarEvent[] };
+          if (response.ok && payload.events) {
+            skipEventsSyncRef.current = true;
+            setState((current) => ({ ...current, events: payload.events as CalendarEvent[] }));
+          }
+        } catch (error) {
+          console.warn("smartaac: failed to sync events to Supabase", error);
+        }
+      })();
+    }, 1500);
+
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.events]);
+
+  // Debounced sync: weekly topic.
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    if (skipTopicSyncRef.current) {
+      skipTopicSyncRef.current = false;
+      return;
+    }
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+
+    const topicLabel =
+      weeklyTopics.find((topic) => topic.id === state.weeklyTopicId)?.label ?? state.weeklyTopicId;
+
+    const timeout = window.setTimeout(() => {
+      void postChildData({ weeklyTopic: { id: state.weeklyTopicId, label: topicLabel } });
+    }, 1500);
+
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.weeklyTopicId]);
+
+  // Debounced sync: symbol favorites/hidden/core/enabled-category flags, plus
+  // custom symbols/categories and label overrides. Bundled together since they
+  // change together via the same dashboard screen and are cheap to send as one
+  // small JSON blob.
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    if (skipSymbolSettingsSyncRef.current) {
+      skipSymbolSettingsSyncRef.current = false;
+      return;
+    }
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      void postChildData({
+        symbolSettings: {
+          hiddenSymbolIds: state.hiddenSymbolIds,
+          favoriteSymbolIds: state.favoriteSymbolIds,
+          coreSymbolIds: state.coreSymbolIds,
+          enabledCategoryIds: state.enabledCategoryIds,
+          customSymbols: state.customSymbols,
+          customCategories: state.customCategories,
+          symbolLabelOverrides: state.symbolLabelOverrides,
+          childGender: state.childGender,
+          smartGrammar: state.smartGrammar,
+        },
+      });
+    }, 1500);
+
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    state.hiddenSymbolIds,
+    state.favoriteSymbolIds,
+    state.coreSymbolIds,
+    state.enabledCategoryIds,
+    state.customSymbols,
+    state.customCategories,
+    state.symbolLabelOverrides,
+    state.childGender,
+    state.smartGrammar,
+  ]);
+
+  // Debounced sync: family photos — isolated from the settings bundle above
+  // since photo payloads are large (same reason they're a separate
+  // localStorage slot) and shouldn't re-upload on every favorite/hide toggle.
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    if (skipSymbolImagesSyncRef.current) {
+      skipSymbolImagesSyncRef.current = false;
+      return;
+    }
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      void postChildData({ symbolImages: state.symbolImages });
+    }, 2000);
+
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.symbolImages]);
+
+  // Debounced sync: usage statistics. Longer debounce since these change on
+  // every symbol tap / sentence spoken — no need to sync them in near-real-time.
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    if (skipUsageStatsSyncRef.current) {
+      skipUsageStatsSyncRef.current = false;
+      return;
+    }
+    if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      void postChildData({
+        usageStats: {
+          usageBySymbolId: state.usageBySymbolId,
+          categoryUsageById: state.categoryUsageById,
+          topicUsageById: state.topicUsageById,
+          sentenceCount: state.sentenceCount,
+          sentenceLengths: state.sentenceLengths,
+        },
+      });
+    }, 10000);
+
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    state.usageBySymbolId,
+    state.categoryUsageById,
+    state.topicUsageById,
+    state.sentenceCount,
+    state.sentenceLengths,
+  ]);
+
+  const continueSavedSession = (): void => {
+    if (!savedSession) return;
+    setIsLoginOpen(false);
+    setIsEntryOpen(false);
+    setIsDashboardOpen(true);
+  };
+
+  const saveRememberedAuth = (email: string, name: string): void => {
+    if (!rememberMe) {
+      window.localStorage.removeItem(rememberedAuthKey);
+      return;
+    }
+    window.localStorage.setItem(
+      rememberedAuthKey,
+      JSON.stringify({ email, name, rememberMe: true }),
+    );
+  };
+
+  const activeTopic = weeklyTopics.find((topic) => topic.id === state.weeklyTopicId);
+  const eventsThisWeek = useMemo(() => getEventsThisWeek(state), [state]);
+  const allSymbols = useMemo(
+    () =>
+      [...symbols, ...state.customSymbols].map((symbol) => ({
+        ...symbol,
+        label: state.symbolLabelOverrides[symbol.id] ?? symbol.label,
+      })),
+    [state.customSymbols, state.symbolLabelOverrides],
+  );
+  const allCategories = useMemo(() => getAllCategories(state), [state.customCategories]);
+  const allSymbolById = useMemo(
+    () => Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])),
+    [allSymbols],
+  ) as Record<string, AacSymbol>;
+  const updateState = (updater: (current: DemoState) => DemoState): void => {
+    setState((current) => updater(current));
+  };
+
+  const speakText = (text: string, onEnd?: () => void): void => {
+    speakHebrew(text, state.speechRate, onEnd);
+  };
+
+  const childGender = state.childGender ?? "boy";
+  const smartGrammarOn = state.smartGrammar !== false;
+
+  const sentenceWords = (tokens: string[]): string[] =>
+    tokens.map((token) => sentenceItemLabel(token, allSymbolById)).filter(Boolean);
+
+  const requestFixedSentence = async (words: string[]): Promise<string | null> => {
+    try {
+      const response = await fetch("/api/fix-sentence", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words, gender: childGender }),
+        signal: AbortSignal.timeout(12000),
+      });
+      const payload = (await readJsonResponse(response)) as { sentence?: string };
+      return response.ok && payload.sentence ? payload.sentence : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Correct the sentence in the background while the child is still building
+  // it, so pressing "הקרא" speaks the fixed version without waiting.
+  useEffect(() => {
+    const words = sentenceWords(sentence);
+    if (!smartGrammarOn || words.length < 2) {
+      setFixedSentence(null);
+      return;
+    }
+    const key = words.join(" ");
+    if (fixedSentence?.key === key) return;
+
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      setIsFixingSentence(true);
+      void requestFixedSentence(words).then((fixed) => {
+        if (cancelled) return;
+        setIsFixingSentence(false);
+        if (fixed) setFixedSentence({ key, text: fixed });
+      });
+    }, 700);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sentence, smartGrammarOn, childGender]);
+
+  const currentSentenceKey = sentenceWords(sentence).join(" ");
+  // Only show the corrected line when it actually changed a word — a fix
+  // that just adds a period or comma isn't worth the child's attention.
+  const withoutPunctuation = (text: string): string => text.replace(/[.,!?״"׳']/g, "").trim();
+  const visibleFixedSentence =
+    fixedSentence &&
+    fixedSentence.key === currentSentenceKey &&
+    withoutPunctuation(fixedSentence.text) !== withoutPunctuation(currentSentenceKey)
+      ? fixedSentence.text
+      : null;
+
+  const addSymbol = (symbolId: string): void => {
+    const symbol = allSymbolById[symbolId];
+    if (!symbol) return;
+
+    setSentence((current) => [...current, symbolId]);
+    updateState((current) => ({
+      ...current,
+      usageBySymbolId: {
+        ...current.usageBySymbolId,
+        [symbolId]: (current.usageBySymbolId[symbolId] ?? 0) + 1,
+      },
+    }));
+    speakText(genderWord(symbol.label, childGender));
+  };
+
+  const addTypedText = (text: string): boolean => {
+    const trimmed = sanitizeTypedText(text);
+    if (!trimmed) return false;
+
+    setSentence((current) => [...current, encodeTypedToken(trimmed)]);
+    speakText(trimmed);
+    return true;
+  };
+
+  const speakSentence = async (symbolIds = sentence): Promise<void> => {
+    if (symbolIds.length === 0) return;
+
+    const words = sentenceWords(symbolIds);
+    const key = words.join(" ");
+    let text = localFixSentence(words, childGender);
+    if (smartGrammarOn && words.length > 1) {
+      if (fixedSentence?.key === key) {
+        text = fixedSentence.text;
+      } else {
+        setIsFixingSentence(true);
+        const fixed = await requestFixedSentence(words);
+        setIsFixingSentence(false);
+        if (fixed) {
+          text = fixed;
+          setFixedSentence({ key, text: fixed });
+        }
+      }
+    }
+
+    speakText(text);
+    updateState((current) => ({
+      ...current,
+      sentenceCount: current.sentenceCount + 1,
+      sentenceLengths: [...current.sentenceLengths, Math.max(1, symbolIds.length)].slice(-100),
+      categoryUsageById: symbolIds.reduce(
+        (usage, symbolId) => {
+          const categoryId = allSymbolById[symbolId]?.categoryId;
+          if (!categoryId || categoryId === "core") return usage;
+
+          return {
+            ...usage,
+            [categoryId]: (usage[categoryId] ?? 0) + 1,
+          };
+        },
+        { ...current.categoryUsageById },
+      ),
+      topicUsageById: {
+        ...current.topicUsageById,
+        [current.weeklyTopicId]: (current.topicUsageById[current.weeklyTopicId] ?? 0) + 1,
+      },
+    }));
+  };
+
+  const useQuickPhrase = (symbolIds: string[], text: string): void => {
+    setSentence(symbolIds);
+    speakText(text);
+  };
+
+  const openDashboardTrigger = (): void => {
+    const nextCount = tapCount + 1;
+    setTapCount(nextCount);
+
+    if (nextCount >= 3) {
+      setTapCount(0);
+      if (isChildDevice) {
+        setIsParentPinOpen(true);
+      } else {
+        setIsLoginOpen(true);
+      }
+    }
+  };
+
+  const requireSupabase = (): boolean => {
+    if (!supabase || !isSupabaseConfigured) {
+      setAuthMessage(
+        "כדי שהכניסה תהיה אמיתית צריך להגדיר NEXT_PUBLIC_SUPABASE_URL ו-NEXT_PUBLIC_SUPABASE_ANON_KEY בקובץ .env.local.",
+      );
+      return false;
+    }
+
+    return true;
+  };
+
+  const openTemporaryParentDashboard = (name: string, email: string): void => {
+    const nextCode = childAccessCode.trim() || state.teacherInviteCode || createTeacherInviteCode();
+
+    updateState((current) => ({
+      ...current,
+      parentEmail: email || "parent@local.app",
+      parentName: name || "הורה זמני",
+      dashboardRole: "parent",
+      isProfileCreator: true,
+      teacherInviteCode: nextCode,
+      activeChildName: childName.trim() || current.activeChildName || "דניאל",
+      isRegisteredInSupabase: false,
+      supabaseUserId: undefined,
+      supabaseChildId: undefined,
+    }));
+    setAuthMessage("");
+    setPassword("");
+    setIsLoginOpen(false);
+    setIsEntryOpen(false);
+    setIsDashboardOpen(true);
+  };
+
+  const finishAuthSuccess = (input: {
+    email: string;
+    name: string;
+    teacherInviteCode?: string;
+    teacherEmail?: string;
+    isFirstLogin?: boolean;
+    userId?: string;
+    childId?: string;
+    childName?: string;
+    linkedChildren?: Array<{ id: string; name: string }>;
+    role: "parent" | "teacher";
+    accountType: AccountType;
+  }): void => {
+    if (input.accountType === "join") {
+      updateState((current) => ({
+        ...current,
+        dashboardRole: input.role,
+        isProfileCreator: false,
+        connectedTeacherEmail: input.email,
+        parentEmail: current.parentEmail || input.email,
+        activeChildName: input.childName ?? current.activeChildName,
+        linkedChildren: input.linkedChildren ?? current.linkedChildren,
+        isRegisteredInSupabase: true,
+        supabaseUserId: input.userId,
+        supabaseChildId: input.childId,
+      }));
+      if (input.childName) {
+        setChildName(input.childName);
+      }
+      saveRememberedAuth(input.email, input.name);
+    } else {
+      updateState((current) => ({
+        ...current,
+        dashboardRole: input.role,
+        isProfileCreator: true,
+        parentEmail: input.email,
+        parentName: input.name,
+        activeChildName: input.childName ?? (childName.trim() || current.activeChildName),
+        teacherInviteCode: input.teacherInviteCode ?? current.teacherInviteCode,
+        connectedTeacherEmail:
+          (input.teacherEmail ?? teacherEmail.trim()) || current.connectedTeacherEmail,
+        pendingTeacherInvite: input.isFirstLogin ? true : current.pendingTeacherInvite,
+        isRegisteredInSupabase: true,
+        supabaseUserId: input.userId,
+        supabaseChildId: input.childId,
+      }));
+      if (input.childName) {
+        setChildName(input.childName);
+      }
+
+      saveRememberedAuth(input.email, input.name);
+
+      if (input.isFirstLogin) {
+        setInviteMessage("כניסה ראשונה! הזינ/י את אימייל מי שתרצ/י להזמין ולחצ/י על 'שלח'.");
+      }
+    }
+
+    setSavedSession({
+      name: input.name,
+      email: input.email,
+      role: input.role,
+    });
+
+    setPassword("");
+    setAuthMessage("");
+    setIsLoginOpen(false);
+    setIsEntryOpen(false);
+    setIsDashboardOpen(true);
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") !== "success") return;
+
+    void (async () => {
+      const recovered = await recoverOAuthAuthResult();
+      window.history.replaceState({}, "", "/");
+
+      if (!recovered) {
+        setAuthMessage(
+          "ההתחברות עם Google הצליחה, אבל לא הצלחנו לשמור ב-Supabase. ודא/י ש-SUPABASE_SERVICE_ROLE_KEY מוגדר ב-.env.local.",
+        );
+        setIsLoginOpen(true);
+        return;
+      }
+
+      finishAuthSuccess({
+        email: recovered.email,
+        name: recovered.name,
+        teacherInviteCode: recovered.teacherInviteCode,
+        teacherEmail: recovered.teacherEmail,
+        isFirstLogin: recovered.isFirstLogin,
+        userId: recovered.userId,
+        childId: recovered.childId,
+        childName: recovered.childName,
+        linkedChildren: recovered.linkedChildren,
+        role: recovered.mode,
+        accountType: recovered.accountType,
+      });
+    })();
+  }, []);
+
+  const submitPassword = async (): Promise<void> => {
+    if (!isSupabaseConfigured) {
+      if (authAccountType === "join") {
+        setAuthMessage("הצטרפות עם קוד צריכה חיבור ל-Supabase. בינתיים אפשר ליצור פרופיל חדש.");
+        return;
+      }
+
+      openTemporaryParentDashboard(parentName.trim(), parentEmail.trim());
+      return;
+    }
+
+    if (!parentEmail.trim() || password.length < 6) {
+      setAuthMessage("להרשמה ב-Supabase צריך אימייל וסיסמה של לפחות 6 תווים.");
+      return;
+    }
+
+    if (authAccountType === "join" && !childAccessCode.trim()) {
+      setAuthMessage("צריך להזין קוד ילד — לפי הקוד המערכת יודעת על איזה ילד לעבוד.");
+      return;
+    }
+
+    const resolved = resolveAuthFields(parentName.trim(), parentEmail.trim());
+    if (resolved.swapped) {
+      setParentName(resolved.name);
+      setParentEmail(resolved.email);
+    }
+
+    const email = resolved.email;
+    if (!isValidEmail(email)) {
+      setAuthMessage(
+        `שדה האימייל לא תקין${email ? `: "${email}"` : ""}. הזינ/י בשדה "אימייל" כתובת תקינה, באותיות לועזיות ובלי רווחים.`,
+      );
+      return;
+    }
+
+    setIsAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const name = resolved.name || (authMode === "parent" ? "הורה" : "מורה");
+
+      const response = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: authMode,
+          accountType: authAccountType,
+          email,
+          password,
+          name,
+          childName: childName.trim() || "דניאל",
+          childAccessCode: childAccessCode.trim(),
+          knownInviteCode: state.teacherInviteCode,
+          functionalityLevel: state.level,
+        }),
+      });
+
+      const payload = (await readJsonResponse(response)) as {
+        error?: string;
+        session?: { access_token: string; refresh_token: string };
+        teacherInviteCode?: string;
+        teacherEmail?: string;
+        isFirstLogin?: boolean;
+        teacherInviteDelivered?: boolean;
+        teacherInviteMailtoUrl?: string;
+        userId?: string;
+        childId?: string;
+        childName?: string;
+        linkedChildren?: Array<{ id: string; name: string }>;
+        savedInSupabase?: boolean;
+      };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "לא הצלחנו להתחבר.");
+      }
+
+      if (!payload.savedInSupabase) {
+        throw new Error("ההרשמה לא נשמרה ב-Supabase.");
+      }
+
+      if (supabase && payload.session) {
+        await supabase.auth
+          .setSession({
+            access_token: payload.session.access_token,
+            refresh_token: payload.session.refresh_token,
+          })
+          .catch(() => undefined);
+      }
+
+      finishAuthSuccess({
+        email,
+        name,
+        teacherInviteCode: payload.teacherInviteCode,
+        isFirstLogin: payload.isFirstLogin,
+        userId: payload.userId,
+        childId: payload.childId,
+        childName: payload.childName,
+        linkedChildren: payload.linkedChildren,
+        role: authMode,
+        accountType: authAccountType,
+      });
+    } catch (error) {
+      setAuthMessage(translateAuthError(getErrorMessage(error)));
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const loginWithGoogle = async (): Promise<void> => {
+    if (!supabase) {
+      setAuthMessage("Google דורש חיבור Supabase.");
+      return;
+    }
+
+    setIsAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const draft: AuthDraft = {
+        mode: authMode,
+        accountType: authAccountType,
+        name: parentName.trim() || (authMode === "parent" ? "הורה" : "מורה"),
+        email: parentEmail.trim(),
+        childName: childName.trim() || "דניאל",
+        childAccessCode: childAccessCode.trim(),
+        functionalityLevel: state.level,
+      };
+
+      window.sessionStorage.setItem(authDraftKey, JSON.stringify(draft));
+
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: `${window.location.origin}/auth/callback`,
+          queryParams: {
+            access_type: "online",
+            prompt: "select_account",
+          },
+        },
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      if (!data.url) {
+        throw new Error(
+          "Google לא מופעל ב-Supabase. הפעילי אותו ב-Authentication → Providers.",
+        );
+      }
+
+      window.location.href = data.url;
+    } catch (error) {
+      setAuthMessage(translateAuthError(getErrorMessage(error)));
+      setIsAuthLoading(false);
+    }
+  };
+
+  const quickParentEntry = (): void => {
+    openTemporaryParentDashboard(parentName.trim(), parentEmail.trim());
+  };
+
+  const visibleCategorySymbols = (categoryId: string): AacSymbol[] =>
+    allSymbols.filter(
+      (symbol) =>
+        symbol.categoryId === categoryId && !state.hiddenSymbolIds.includes(symbol.id),
+    );
+
+  // Button size stays constant across functionality levels — only which
+  // symbols appear (and how many) changes with level, not their size.
+  const symbolTileSize = "min-h-32";
+
+  const rotateTeacherCode = async (): Promise<string | null> => {
+    if (!supabase || !state.isRegisteredInSupabase) {
+      const nextCode = createTeacherInviteCode();
+      updateState((current) => ({ ...current, teacherInviteCode: nextCode }));
+      return nextCode;
+    }
+
+    const sessionResult = await supabase.auth.getSession();
+    const accessToken = sessionResult.data.session?.access_token;
+    if (!accessToken) {
+      throw new Error("ההתחברות פגה. התחבר/י שוב כהורה.");
+    }
+
+    const response = await fetch("/api/teacher-code", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ childId: state.supabaseChildId }),
+    });
+
+    const payload = (await readJsonResponse(response)) as { code?: string; error?: string };
+    if (!response.ok || !payload.code) {
+      throw new Error(payload.error ?? "לא הצלחנו ליצור קוד חדש.");
+    }
+
+    const nextCode = payload.code;
+    updateState((current) => ({ ...current, teacherInviteCode: nextCode }));
+    return nextCode;
+  };
+
+  const saveActiveChildName = async (name: string): Promise<void> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error("הזינ/י שם לילד/ה.");
+    }
+
+    setChildName(trimmed);
+    updateState((current) => ({
+      ...current,
+      activeChildName: trimmed,
+      linkedChildren: current.linkedChildren.map((child) =>
+        child.id === current.supabaseChildId ? { ...child, name: trimmed } : child,
+      ),
+    }));
+
+    if (!supabase || !state.isRegisteredInSupabase) {
+      return;
+    }
+
+    const sessionResult = await supabase.auth.getSession();
+    const accessToken = sessionResult.data.session?.access_token;
+    if (!accessToken) {
+      throw new Error("ההתחברות פגה. התחבר/י שוב.");
+    }
+
+    const response = await fetch("/api/child-name", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        childId: state.supabaseChildId,
+        name: trimmed,
+      }),
+    });
+
+    const payload = (await readJsonResponse(response)) as { name?: string; error?: string };
+    if (!response.ok) {
+      throw new Error(payload.error ?? "לא הצלחנו לשמור את השם ב-Supabase.");
+    }
+
+    if (payload.name) {
+      setChildName(payload.name);
+      updateState((current) => ({
+        ...current,
+        activeChildName: payload.name ?? trimmed,
+        linkedChildren: current.linkedChildren.map((child) =>
+          child.id === current.supabaseChildId ? { ...child, name: payload.name ?? trimmed } : child,
+        ),
+      }));
+    }
+  };
+
+  const sendTeacherInvite = async (
+    emailOverride: string,
+    inviteeRole: "parent" | "teacher",
+  ): Promise<string> => {
+    const email = emailOverride.trim();
+    if (!email || !isValidEmail(email)) {
+      throw new Error("הזינ/י אימייל תקין.");
+    }
+
+    if (!state.teacherInviteCode) {
+      throw new Error("חסר קוד גישה.");
+    }
+
+    if (supabase && state.isRegisteredInSupabase) {
+      const session = await supabase.auth.getSession();
+      const token = session.data.session?.access_token;
+      if (token) {
+        const response = await fetch("/api/teacher-invite", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            teacherEmail: email,
+            teacherInviteCode: state.teacherInviteCode,
+            childId: state.supabaseChildId,
+            appOrigin: window.location.origin,
+            inviteeRole,
+            inviterRole: state.dashboardRole ?? "parent",
+          }),
+        });
+
+        const payload = (await readJsonResponse(response)) as {
+          delivered?: boolean;
+          error?: string;
+        };
+
+        if (response.ok && payload.delivered) {
+          setTeacherEmail(email);
+          updateState((current) => ({
+            ...current,
+            connectedTeacherEmail: inviteeRole === "teacher" ? email : current.connectedTeacherEmail,
+            pendingTeacherInvite: false,
+          }));
+          return `המייל נשלח בהצלחה ל-${email}`;
+        }
+
+        console.warn("smartaac: automatic invite email failed", payload.error);
+      }
+    }
+
+    // Automatic sending failed or isn't configured (e.g. Brevo blocking this
+    // server's IP) — fall back to the user's own mail app with the invite
+    // already written, so inviting never dead-ends.
+    openTeacherInviteMail({
+      teacherEmail: email,
+      teacherInviteCode: state.teacherInviteCode,
+      childName: state.activeChildName,
+      parentName: state.parentName || (state.dashboardRole === "teacher" ? "מורה" : "הורה"),
+      inviteeRole,
+    });
+    return "השליחה האוטומטית לא זמינה כרגע — נפתח חלון מייל עם ההזמנה מוכנה. רק ללחוץ 'שלח'.";
+  };
+
+  if (isDashboardOpen) {
+    return (
+      <Dashboard
+        view={dashboardView}
+        state={state}
+        activeTopic={activeTopic}
+        allSymbols={allSymbols}
+        allCategories={allCategories}
+        allSymbolById={allSymbolById}
+        onViewChange={setDashboardView}
+        onStateChange={setState}
+        onRotateTeacherCode={rotateTeacherCode}
+        onSendTeacherInvite={sendTeacherInvite}
+        teacherEmail={teacherEmail}
+        onTeacherEmailChange={setTeacherEmail}
+        inviteMessage={inviteMessage}
+        onActiveChildNameChange={saveActiveChildName}
+        isChildDevice={isChildDevice}
+        onChildDeviceChange={setIsChildDevice}
+        onClose={() => {
+          setIsDashboardOpen(false);
+          // A child device goes straight back to the board, not the entry screen.
+          setIsEntryOpen(!isChildDevice);
+          setChildView({ type: "home" });
+        }}
+      />
+    );
+  }
+
+  if (isEntryOpen) {
+    return (
+      <main className="min-h-screen overflow-auto bg-[radial-gradient(circle_at_top_left,_#ffffff_0,_transparent_34%),linear-gradient(135deg,_#eef5fb,_#f9fbff)] p-5">
+        <section className="mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-6xl flex-col justify-center">
+          <div className="mb-8 rounded-[2rem] border border-white/80 bg-white/80 p-6 shadow-soft backdrop-blur md:p-10">
+            <div className="mb-4 inline-flex rounded-full bg-blue-50 px-4 py-2 text-sm font-black text-blue-700">
+              SmartAAC · תקשורת תומכת
+            </div>
+            <h1 className="max-w-3xl text-4xl font-black leading-tight md:text-6xl">
+              מערכת לילד המיוחד
+            </h1>
+            <p className="mt-4 max-w-3xl text-lg leading-8 text-muted">
+              עם לוח בקרה להורה ולמטפל
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            {savedSession && (
+              <button
+                type="button"
+                className="group flex h-full flex-col rounded-[2rem] border border-violet-100 bg-violet-50 p-7 text-right shadow-soft transition hover:-translate-y-1 md:col-span-2"
+                onClick={continueSavedSession}
+              >
+                <span className="block text-4xl">🔓</span>
+                <span className="mt-4 block text-2xl font-black">
+                  שלום {savedSession.name}, המשיכ/י ללוח הבקרה
+                </span>
+                <span className="mt-2 block text-muted" dir="ltr">
+                  {savedSession.email} · {savedSession.role === "teacher" ? "מורה" : "הורה"}
+                </span>
+                <span className="mt-4 inline-flex rounded-full bg-violet-200 px-5 py-3 font-black text-violet-900">
+                  כניסה מהירה — הסיסמה נשמרה
+                </span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="group flex h-full flex-col rounded-[2rem] border border-emerald-100 bg-white p-7 text-right shadow-soft transition hover:-translate-y-1 hover:bg-emerald-50"
+              onClick={() => {
+                setIsEntryOpen(false);
+                setChildView({ type: "home" });
+              }}
+            >
+              <span className="block text-6xl">🧒</span>
+              <span className="mt-5 block text-3xl font-black">כניסת ילד</span>
+              <span className="mt-3 block text-lg leading-8 text-muted">
+                פתיחה ישירה למסך התקשורת: סמלי ליבה, קטגוריות, משפטים מוכנים והקראה קולית.
+              </span>
+              <span className="mt-6 inline-flex rounded-full bg-emerald-100 px-5 py-3 font-black text-emerald-800">
+                פתחו את לוח התקשורת
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className="group flex h-full flex-col rounded-[2rem] border border-blue-100 bg-white p-7 text-right shadow-soft transition hover:-translate-y-1 hover:bg-blue-50"
+              onClick={() => setIsLoginOpen(true)}
+            >
+              <span className="block text-6xl">👩‍👧</span>
+              <span className="mt-5 block text-3xl font-black">כניסת הורה / מטפל</span>
+              <span className="mt-3 block text-lg leading-8 text-muted">
+                ניהול אירועים, לוח שנה, נושא שבועי, רמת תפקוד, סמלים ומעקב התקדמות.
+              </span>
+              <span className="mt-6 inline-flex rounded-full bg-blue-100 px-5 py-3 font-black text-blue-800">
+                כניסה עם סיסמה
+              </span>
+            </button>
+          </div>
+        </section>
+
+        {isLoginOpen && (
+          <LoginModal
+            password={password}
+            parentName={parentName}
+            parentEmail={parentEmail}
+            authMode={authMode}
+            accountType={authAccountType}
+            childName={childName}
+            childAccessCode={childAccessCode}
+            rememberMe={rememberMe}
+            authMessage={authMessage}
+            isLoading={isAuthLoading}
+            supabaseReady={isSupabaseConfigured}
+            onGoogle={loginWithGoogle}
+            onAuthModeChange={setAuthMode}
+            onAccountTypeChange={setAuthAccountType}
+            onChildNameChange={setChildName}
+            onChildAccessCodeChange={setChildAccessCode}
+            onRememberMeChange={setRememberMe}
+            onParentNameChange={setParentName}
+            onParentEmailChange={setParentEmail}
+            onPasswordChange={setPassword}
+            onCancel={() => setIsLoginOpen(false)}
+            onSubmit={submitPassword}
+            onQuickEntry={quickParentEntry}
+          />
+        )}
+      </main>
+    );
+  }
+
+  return (
+    <main className="flex h-screen flex-col overflow-hidden bg-[radial-gradient(circle_at_top_right,_#dff7ff_0,_transparent_35%),linear-gradient(135deg,_#eaf5ff,_#f7fbff_48%,_#eafaf4)] p-3">
+      <button
+        type="button"
+        aria-label="כניסת מטפל"
+        className="fixed left-0 top-0 z-30 h-14 w-14"
+        onClick={openDashboardTrigger}
+      />
+
+      <header className="mx-auto flex w-full max-w-7xl gap-3 overflow-x-auto rounded-t-[2rem] border border-white bg-white/90 p-3 shadow-soft backdrop-blur">
+        <button
+          type="button"
+          className="min-w-20 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-black text-white shadow-sm"
+          onClick={() => (isChildDevice ? setChildView({ type: "home" }) : setIsEntryOpen(true))}
+        >
+          בית
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl border-2 border-red-200 bg-red-50 text-center font-black text-red-800 shadow-sm"
+          onClick={() => setSentence((current) => current.slice(0, -1))}
+          aria-label="מחק סמל אחרון"
+          title="מחיקת מילה"
+        >
+          <span className="block text-2xl">⌫</span>
+          <span className="block text-xs">מילה</span>
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl border-2 border-red-300 bg-red-100 text-center font-black text-red-900 shadow-sm"
+          onClick={() => setSentence([])}
+          aria-label="מחק משפט"
+          title="מחיקת משפט"
+        >
+          <span className="block text-2xl">🗑️</span>
+          <span className="block text-xs">משפט</span>
+        </button>
+
+        <div
+          className={cx(
+            "flex min-h-20 flex-1 items-center gap-2 overflow-x-auto rounded-[1.5rem] border-4 border-blue-200 bg-gradient-to-l from-white to-blue-50 p-3 shadow-inner",
+            sentence.length === 0 && "text-muted",
+          )}
+        >
+          {sentence.length === 0 ? (
+            <span className="px-3 text-2xl font-black text-slate-400">
+              בנה משפט בעזרת הסמלים...
+            </span>
+          ) : (
+            sentence.map((symbolId, index) => {
+              const symbol = allSymbolById[symbolId];
+              const label = sentenceItemLabel(symbolId, allSymbolById);
+              if (!label) return null;
+              const imageUrl = symbol
+                ? resolveSymbolImage(symbol, state.symbolImages)
+                : undefined;
+              return (
+                <span
+                  key={`${symbolId}-${index}`}
+                  className="min-w-20 rounded-2xl border-2 border-blue-100 bg-white px-3 py-2 text-center shadow-sm"
+                >
+                  {imageUrl || symbol?.pictogramId ? (
+                    <img
+                      src={imageUrl || arasaacImageUrl(symbol?.pictogramId as number)}
+                      alt={label}
+                      className={cx(
+                        "mx-auto h-10 w-10 object-cover",
+                        imageUrl ? "rounded-full" : "rounded-md",
+                      )}
+                    />
+                  ) : (
+                    <span className="block text-2xl">{symbol?.emoji ?? "⌨️"}</span>
+                  )}
+                  <span className="block text-xs text-muted">{label}</span>
+                </span>
+              );
+            })
+          )}
+        </div>
+
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-blue-600 text-center font-black text-white shadow-soft"
+          onClick={() => void speakSentence()}
+          aria-label="הקרא משפט"
+          title="הקראה"
+        >
+          <span className="block text-2xl">{isFixingSentence ? "✨" : "🔊"}</span>
+          <span className="block text-xs">הקרא</span>
+        </button>
+
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-sky-300 text-center font-black text-sky-950 shadow-sm"
+          onClick={() => setChildView({ type: "keyboard" })}
+          aria-label="מקלדת להקלדה"
+          title="מקלדת"
+        >
+          <span className="block text-2xl">⌨️</span>
+          <span className="block text-xs">מקלדת</span>
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-violet-300 text-center font-black text-violet-950 shadow-sm"
+          onClick={() => setChildView({ type: "events" })}
+          aria-label="לוח אירועים"
+          title="לוח אירועים"
+        >
+          <span className="block text-2xl">🗓️</span>
+          <span className="block text-xs">אירועים</span>
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-emerald-300 text-center font-black text-emerald-950 shadow-sm"
+          onClick={() => setChildView({ type: "assistant" })}
+          aria-label="שיחה חכמה"
+          title="שיחה חכמה"
+        >
+          <span className="block text-2xl">🗣️</span>
+          <span className="block text-xs">שיחה</span>
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-rose-300 text-center font-black text-rose-950 shadow-sm"
+          onClick={() => setChildView({ type: "story" })}
+          aria-label="בואו נספר סיפור"
+          title="סיפור"
+        >
+          <span className="block text-2xl">📖</span>
+          <span className="block text-xs">סיפור</span>
+        </button>
+        <button
+          type="button"
+          className="grid min-h-20 w-24 shrink-0 place-items-center rounded-2xl border-2 border-slate-300 bg-white px-1 text-center font-black text-slate-700 shadow-sm"
+          onClick={() => {
+            // On the child's own device the parent PIN guards the dashboard;
+            // elsewhere this is the regular parent/teacher sign-in.
+            if (isChildDevice) {
+              setIsParentPinOpen(true);
+            } else if (savedSession) {
+              continueSavedSession();
+            } else {
+              setIsLoginOpen(true);
+            }
+          }}
+          aria-label="חזרה למסך הורה / מורה"
+          title="חזרה למסך הורה / מורה"
+        >
+          <span className="block text-2xl">🔒</span>
+          <span className="block text-[11px] leading-tight">מסך הורה / מורה</span>
+        </button>
+      </header>
+
+      {smartGrammarOn && (visibleFixedSentence || (isFixingSentence && sentence.length > 1)) && (
+        <div className="mx-auto flex w-full max-w-7xl items-center gap-3 border-x border-white bg-violet-50/95 px-5 py-2 shadow-sm">
+          <span className="text-xl">✨</span>
+          {visibleFixedSentence ? (
+            <button
+              type="button"
+              className="text-right text-xl font-black text-violet-950"
+              onClick={() => speakText(visibleFixedSentence)}
+              title="השמע את המשפט המתוקן"
+            >
+              {visibleFixedSentence}
+            </button>
+          ) : (
+            <span className="text-sm font-bold text-violet-700">מסדר/ת את המשפט…</span>
+          )}
+        </div>
+      )}
+
+      <section className="mx-auto flex w-full max-w-7xl flex-1 min-h-0 flex-col overflow-hidden rounded-b-[2rem] border-x border-b border-white bg-white/55 p-3 shadow-soft backdrop-blur sm:p-4">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        {childView.type === "home" && (
+          <KeshetHomeView
+            childName={state.activeChildName || childName}
+            level={state.level}
+            coreSymbolIds={state.coreSymbolIds}
+            enabledCategoryIds={state.enabledCategoryIds}
+            allCategories={allCategories}
+            allSymbols={allSymbols.filter((symbol) => !state.hiddenSymbolIds.includes(symbol.id))}
+            favoriteSymbolIds={state.favoriteSymbolIds}
+            symbolImages={state.symbolImages}
+            onSymbolClick={addSymbol}
+            onCategoryClick={(categoryId) => setChildView({ type: "category", categoryId })}
+          />
+        )}
+
+        {childView.type === "category" && (
+          <CategoryView
+            categoryId={childView.categoryId}
+            allCategories={allCategories}
+            symbols={visibleCategorySymbols(childView.categoryId)}
+            symbolImages={state.symbolImages}
+            tileSize={symbolTileSize}
+            onBack={() => setChildView({ type: "home" })}
+            onSymbolClick={addSymbol}
+          />
+        )}
+
+        {childView.type === "keyboard" && (
+          <KeyboardView
+            onBack={() => setChildView({ type: "home" })}
+            onSpeak={speakText}
+            onAddToSentence={addTypedText}
+          />
+        )}
+
+        {childView.type === "events" && (
+          <ChildEventsView
+            eventsThisWeek={eventsThisWeek}
+            activeTopic={activeTopic}
+            topicSymbols={(activeTopic?.symbolIds ?? [])
+              .filter((symbolId) => !state.hiddenSymbolIds.includes(symbolId))
+              .map((symbolId) => allSymbolById[symbolId])
+              .filter(Boolean)}
+            symbolImages={state.symbolImages}
+            onSymbolClick={addSymbol}
+            onBack={() => setChildView({ type: "home" })}
+            onPromptClick={(prompt) => speakText(prompt)}
+            onPhraseClick={(phrase) => speakText(phrase)}
+          />
+        )}
+
+        {childView.type === "assistant" && (
+          <VoiceAssistantView
+            onBack={() => setChildView({ type: "home" })}
+            onSpeak={speakText}
+            speechRate={state.speechRate}
+          />
+        )}
+
+        {childView.type === "story" && (
+          <StoryGameView onBack={() => setChildView({ type: "home" })} onSpeak={speakText} />
+        )}
+        </div>
+      </section>
+
+      {isLoginOpen && (
+        <LoginModal
+          password={password}
+          parentName={parentName}
+          parentEmail={parentEmail}
+          authMode={authMode}
+          accountType={authAccountType}
+          childName={childName}
+          childAccessCode={childAccessCode}
+          rememberMe={rememberMe}
+          authMessage={authMessage}
+          isLoading={isAuthLoading}
+          supabaseReady={isSupabaseConfigured}
+          onGoogle={loginWithGoogle}
+          onAuthModeChange={setAuthMode}
+          onAccountTypeChange={setAuthAccountType}
+          onChildNameChange={setChildName}
+          onChildAccessCodeChange={setChildAccessCode}
+          onRememberMeChange={setRememberMe}
+          onParentNameChange={setParentName}
+          onParentEmailChange={setParentEmail}
+          onPasswordChange={setPassword}
+          onCancel={() => setIsLoginOpen(false)}
+          onSubmit={submitPassword}
+          onQuickEntry={quickParentEntry}
+        />
+      )}
+
+      {isParentPinOpen && (
+        <ParentPinModal
+          onSuccess={() => {
+            setIsParentPinOpen(false);
+            setIsDashboardOpen(true);
+          }}
+          onForgot={() => {
+            // Forgot the PIN: sign in with email + password instead, then set
+            // a new PIN in the dashboard.
+            setIsParentPinOpen(false);
+            setIsLoginOpen(true);
+          }}
+          onCancel={() => setIsParentPinOpen(false)}
+        />
+      )}
+    </main>
+  );
+}
+
+function LoginModal({
+  password,
+  parentName,
+  parentEmail,
+  authMode,
+  accountType,
+  childName,
+  childAccessCode,
+  rememberMe,
+  authMessage,
+  isLoading,
+  supabaseReady,
+  onGoogle,
+  onAuthModeChange,
+  onAccountTypeChange,
+  onChildNameChange,
+  onChildAccessCodeChange,
+  onRememberMeChange,
+  onParentNameChange,
+  onParentEmailChange,
+  onPasswordChange,
+  onCancel,
+  onSubmit,
+  onQuickEntry,
+}: {
+  password: string;
+  parentName: string;
+  parentEmail: string;
+  authMode: AuthMode;
+  accountType: AccountType;
+  childName: string;
+  childAccessCode: string;
+  rememberMe: boolean;
+  authMessage: string;
+  isLoading: boolean;
+  supabaseReady: boolean;
+  onGoogle: () => void;
+  onAuthModeChange: (mode: AuthMode) => void;
+  onAccountTypeChange: (accountType: AccountType) => void;
+  onChildNameChange: (value: string) => void;
+  onChildAccessCodeChange: (value: string) => void;
+  onRememberMeChange: (value: boolean) => void;
+  onParentNameChange: (value: string) => void;
+  onParentEmailChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+  onCancel: () => void;
+  onSubmit: () => void;
+  onQuickEntry: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+      <div className="flex min-h-full justify-center">
+        <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
+        <div className="mb-4 rounded-2xl bg-blue-50 p-4">
+          <h2 className="mb-1 text-2xl font-black">
+            {supabaseReady
+              ? accountType === "create"
+                ? "יצירת פרופיל חדש"
+                : "הצטרפות עם קוד"
+              : "כניסה למערכת"}
+          </h2>
+          <p className="text-muted">
+            {supabaseReady
+              ? accountType === "create"
+                ? "מלא/י אימייל וסיסמה. המערכת תיצור חשבון ופרופיל ילד חדש — ותקבל/י קוד לשתף עם מי שתרצ/י להזמין."
+                : "התחבר/י עם אימייל וסיסמה, והזינ/י את הקוד שקיבלת כדי להצטרף לילד שכבר קיים."
+              : "אין חיבור Supabase. אפשר לנסות את לוח הבקרה בלבד, בלי שמירה בשרת."}
+          </p>
+        </div>
+        <div className="mb-3">
+          <span className="mb-1 block text-xs font-black text-slate-500">התפקיד שלך (לתצוגה בלבד)</span>
+          <div className="grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1">
+            <button
+              type="button"
+              className={cx(
+                "rounded-xl px-4 py-3 font-black",
+                authMode === "parent" && "bg-white text-blue-700 shadow-sm",
+              )}
+              onClick={() => onAuthModeChange("parent")}
+            >
+              הורה
+            </button>
+            <button
+              type="button"
+              className={cx(
+                "rounded-xl px-4 py-3 font-black",
+                authMode === "teacher" && "bg-white text-blue-700 shadow-sm",
+              )}
+              onClick={() => onAuthModeChange("teacher")}
+            >
+              מורה
+            </button>
+          </div>
+        </div>
+        {supabaseReady && (
+          <div className="mb-4">
+            <span className="mb-1 block text-xs font-black text-slate-500">
+              יוצר/ת פרופיל חדש או מצטרפ/ת לקיים?
+            </span>
+            <div className="grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1">
+              <button
+                type="button"
+                className={cx(
+                  "rounded-xl px-4 py-3 text-sm font-black",
+                  accountType === "create" && "bg-white text-blue-700 shadow-sm",
+                )}
+                onClick={() => onAccountTypeChange("create")}
+              >
+                יצירת פרופיל חדש
+              </button>
+              <button
+                type="button"
+                className={cx(
+                  "rounded-xl px-4 py-3 text-sm font-black",
+                  accountType === "join" && "bg-white text-blue-700 shadow-sm",
+                )}
+                onClick={() => onAccountTypeChange("join")}
+              >
+                יש לי קוד להצטרפות
+              </button>
+            </div>
+          </div>
+        )}
+        <button
+          type="button"
+          className="mb-4 flex w-full items-center justify-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 font-black shadow-sm"
+          onClick={onGoogle}
+          disabled={isLoading}
+        >
+          <span className="text-xl">G</span>
+          {isLoading ? "פותח Google..." : "התחברות עם Google"}
+        </button>
+        <div className="mb-3 grid gap-3">
+          <label className="grid gap-1">
+            <span className="text-sm font-black text-slate-600">אימייל</span>
+            <input
+              className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+              type="email"
+              dir="ltr"
+              autoComplete="email"
+              value={parentEmail}
+              onChange={(event) => onParentEmailChange(event.target.value)}
+              placeholder="האימייל שלך"
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-sm font-black text-slate-600">
+              {authMode === "parent" ? "שם ההורה" : "שם המורה"}
+            </span>
+            <input
+              className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+              autoComplete="name"
+              value={parentName}
+              onChange={(event) => onParentNameChange(event.target.value)}
+              placeholder="השם שלך"
+            />
+          </label>
+          {accountType === "create" ? (
+            <label className="grid gap-1">
+              <span className="text-sm font-black text-slate-600">שם הילד</span>
+              <input
+                className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+                value={childName}
+                onChange={(event) => onChildNameChange(event.target.value)}
+                placeholder="שם הילד"
+              />
+            </label>
+          ) : (
+            <label className="grid gap-1">
+              <span className="text-sm font-black text-slate-600">קוד הילד — בוחר איזה ילד פעיל</span>
+              <input
+                className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+                dir="ltr"
+                value={childAccessCode}
+                onChange={(event) => onChildAccessCodeChange(event.target.value)}
+                placeholder="קוד הגישה — חובה בכל כניסה"
+              />
+            </label>
+          )}
+        </div>
+        <label className="grid gap-1">
+          <span className="text-sm font-black text-slate-600">סיסמת החשבון</span>
+          <input
+            className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+            type="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(event) => onPasswordChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") onSubmit();
+            }}
+            placeholder="לפחות 6 תווים"
+          />
+        </label>
+        <label className="mt-3 flex items-center gap-2 text-sm font-bold text-slate-700">
+          <input
+            type="checkbox"
+            checked={rememberMe}
+            onChange={(event) => onRememberMeChange(event.target.checked)}
+          />
+          זכור אותי — כניסה מהירה בפעם הבאה
+        </label>
+        {authMessage && (
+          <p className="mt-3 rounded-2xl bg-amber-50 p-3 text-sm font-bold text-amber-900">
+            {authMessage}
+          </p>
+        )}
+        <div className="mt-5 flex flex-col gap-3">
+          <button
+            type="button"
+            className="w-full rounded-2xl bg-blue-500 px-5 py-3 font-bold text-white"
+            onClick={onSubmit}
+            disabled={isLoading}
+          >
+            {isLoading
+              ? "מתחבר..."
+              : supabaseReady
+                ? accountType === "create"
+                  ? "הרשמה / כניסה"
+                  : "כניסה"
+                : "כניסה מקומית"}
+          </button>
+          <div className="flex flex-wrap justify-end gap-3">
+            {!supabaseReady && accountType === "create" && (
+              <button
+                type="button"
+                className="mr-auto rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-3 text-sm font-bold text-emerald-800"
+                onClick={onQuickEntry}
+              >
+                כניסה מקומית בלי שדות
+              </button>
+            )}
+            <button
+              type="button"
+              className="rounded-2xl border border-slate-200 px-5 py-3 font-bold"
+              onClick={onCancel}
+            >
+              ביטול
+            </button>
+          </div>
+        </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const keshetLabelStyles: Record<string, string> = {
+  core: "bg-amber-300 text-amber-950",
+  people: "bg-yellow-300 text-yellow-950",
+  feelings: "bg-pink-300 text-pink-950",
+  actions: "bg-emerald-400 text-emerald-950",
+  food: "bg-orange-300 text-orange-950",
+  school: "bg-sky-400 text-sky-950",
+  games: "bg-violet-400 text-violet-950",
+  colors: "bg-slate-200 text-slate-950",
+};
+
+function getKeshetRowSymbols(
+  categoryId: string,
+  allSymbols: AacSymbol[],
+  favoriteSymbolIds: string[],
+  limit: number,
+): AacSymbol[] {
+  const categorySymbols = allSymbols.filter((symbol) => symbol.categoryId === categoryId);
+
+  // Favorites get priority to be included within the limit, but the returned
+  // order always follows `categorySymbols` so a symbol's on-screen position
+  // stays fixed regardless of which symbols happen to be favorited right now.
+  const favorites = categorySymbols.filter((symbol) => favoriteSymbolIds.includes(symbol.id));
+  const rest = categorySymbols.filter((symbol) => !favoriteSymbolIds.includes(symbol.id));
+  const includedIds = new Set(
+    [...favorites, ...rest].slice(0, limit).map((symbol) => symbol.id),
+  );
+
+  return categorySymbols.filter((symbol) => includedIds.has(symbol.id));
+}
+
+function KeshetRow({
+  label,
+  emoji,
+  labelClassName,
+  symbols,
+  symbolImages,
+  isPeople = false,
+  childName,
+  showNameCell = false,
+  slotCount = 0,
+  onSymbolClick,
+  onMore,
+}: {
+  label: string;
+  emoji: string;
+  labelClassName: string;
+  symbols: AacSymbol[];
+  symbolImages: Record<string, string>;
+  isPeople?: boolean;
+  childName?: string;
+  showNameCell?: boolean;
+  // Rows with fewer symbols (e.g. a new custom category) keep the same button
+  // size as full rows: empty slots fill the rest instead of stretching tiles.
+  slotCount?: number;
+  onSymbolClick: (symbolId: string) => void;
+  onMore?: () => void;
+}) {
+  return (
+    <div className="flex min-h-[5.25rem] shrink-0 flex-row-reverse gap-1.5 sm:min-h-[6rem]">
+      <div
+        className={cx(
+          "flex w-14 shrink-0 flex-col items-center justify-center rounded-xl border-2 border-slate-900 text-center font-black shadow-sm sm:w-[4.5rem]",
+          labelClassName,
+        )}
+      >
+        <span className="text-xl leading-none sm:text-2xl">{emoji}</span>
+        <span className="mt-1 text-xs leading-tight sm:text-sm">{label}</span>
+      </div>
+      <div className="flex min-w-0 flex-1 gap-1.5">
+        {showNameCell && childName ? (
+          <div className="flex min-w-[5rem] shrink-0 flex-col items-center justify-center rounded-xl border-[3px] border-slate-900 bg-violet-200 px-2 py-1 text-center font-black shadow-sm sm:min-w-[6rem]">
+            <span className="text-xs leading-tight text-violet-800 sm:text-sm">שם</span>
+            <span className="text-sm leading-tight sm:text-base">{childName}</span>
+          </div>
+        ) : null}
+        {symbols.map((symbol) => (
+          <SymbolTile
+            key={symbol.id}
+            symbol={symbol}
+            imageUrl={resolveSymbolImage(symbol, symbolImages)}
+            className="min-w-0 flex-1"
+            variant={isPeople ? "keshet-people" : "keshet"}
+            onClick={() => onSymbolClick(symbol.id)}
+          />
+        ))}
+        {Array.from({ length: Math.max(0, slotCount - symbols.length) }, (_, index) => (
+          <div
+            key={`empty-slot-${index}`}
+            // Same border + padding as a tile, so flex gives every slot the exact same width.
+            className="min-w-0 flex-1 border-[3px] border-transparent p-1 sm:p-1.5"
+            aria-hidden
+          />
+        ))}
+        {onMore ? (
+          <button
+            type="button"
+            className="flex min-w-14 shrink-0 flex-col items-center justify-center rounded-xl border-[3px] border-slate-900 bg-white px-1 font-black shadow-sm transition active:scale-95 sm:min-w-16"
+            onClick={onMore}
+            aria-label={`עוד ${label}`}
+          >
+            <span className="text-xl leading-none sm:text-2xl">←</span>
+            <span className="mt-1 text-xs leading-tight sm:text-sm">עוד</span>
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function KeshetHomeView({
+  childName,
+  level,
+  coreSymbolIds,
+  enabledCategoryIds,
+  allCategories,
+  allSymbols,
+  favoriteSymbolIds,
+  symbolImages,
+  onSymbolClick,
+  onCategoryClick,
+}: {
+  childName: string;
+  level: FunctionalityLevel;
+  coreSymbolIds: string[];
+  enabledCategoryIds: string[];
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allSymbols: AacSymbol[];
+  favoriteSymbolIds: string[];
+  symbolImages: Record<string, string>;
+  onSymbolClick: (symbolId: string) => void;
+  onCategoryClick: (categoryId: string) => void;
+}) {
+  const previewLimit = keshetPreviewCount[level];
+  const keshetOrderSet = new Set<string>(keshetCategoryOrder);
+  const coreSet = new Set(coreSymbolIds);
+  const symbolById = Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])) as Record<
+    string,
+    AacSymbol
+  >;
+
+  const coreSymbols = keshetCoreSymbolIds
+    .filter((symbolId) => coreSet.has(symbolId))
+    .map((symbolId) => symbolById[symbolId])
+    .filter((symbol): symbol is AacSymbol => Boolean(symbol));
+
+  const orderedCategoryIds = [
+    ...keshetCategoryOrder.filter((categoryId) => enabledCategoryIds.includes(categoryId)),
+    ...allCategories
+      .map((category) => category.id)
+      .filter(
+        (categoryId) =>
+          enabledCategoryIds.includes(categoryId) && !keshetOrderSet.has(categoryId),
+      ),
+  ];
+
+  return (
+    <div className="flex flex-col gap-2 pb-2">
+      <KeshetRow
+        label="ליבה"
+        emoji="⭐"
+        labelClassName={keshetLabelStyles.core}
+        symbols={coreSymbols}
+        symbolImages={symbolImages}
+        showNameCell
+        childName={childName}
+        onSymbolClick={onSymbolClick}
+      />
+      {orderedCategoryIds.map((categoryId) => {
+        const category = allCategories.find((item) => item.id === categoryId);
+        if (!category) return null;
+
+        const rowSymbols = getKeshetRowSymbols(
+          categoryId,
+          allSymbols,
+          favoriteSymbolIds,
+          previewLimit,
+        );
+
+        return (
+          <KeshetRow
+            key={categoryId}
+            label={category.label}
+            emoji={category.emoji}
+            labelClassName={keshetLabelStyles[categoryId] ?? customCategoryLabelColor(categoryId)}
+            symbols={rowSymbols}
+            symbolImages={symbolImages}
+            isPeople={categoryId === "people"}
+            slotCount={previewLimit}
+            onSymbolClick={onSymbolClick}
+            onMore={() => onCategoryClick(categoryId)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function HomeView({
+  level,
+  enabledCategoryIds,
+  allCategories,
+  usefulSymbols,
+  symbolImages,
+  onPhraseClick,
+  onSymbolClick,
+  onCategoryClick,
+}: {
+  level: FunctionalityLevel;
+  enabledCategoryIds: string[];
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  usefulSymbols: AacSymbol[];
+  symbolImages: Record<string, string>;
+  onPhraseClick: (phrase: (typeof quickPhrases)[number]) => void;
+  onSymbolClick: (symbolId: string) => void;
+  onCategoryClick: (categoryId: string) => void;
+}) {
+  return (
+    <div className="space-y-5">
+      <section className="rounded-[2rem] border border-blue-100 bg-white p-4 shadow-soft">
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8">
+          {usefulSymbols.map((symbol) => (
+            <SymbolTile
+              key={symbol.id}
+              symbol={symbol}
+              imageUrl={resolveSymbolImage(symbol, symbolImages)}
+              className="min-h-20"
+              onClick={() => onSymbolClick(symbol.id)}
+              variant="home"
+            />
+          ))}
+        </div>
+      </section>
+
+      {level !== "high" ? (
+        <section className="rounded-[2rem] border border-orange-100 bg-white p-4 shadow-soft">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
+            {quickPhrases.slice(0, level === "low" ? 8 : 12).map((phrase) => (
+              <button
+                key={phrase.text}
+                type="button"
+                className="flex min-h-20 items-center gap-2 rounded-[1.25rem] border-2 border-orange-200 bg-gradient-to-br from-orange-50 via-white to-amber-100 p-3 text-right shadow-sm transition hover:-translate-y-0.5 active:scale-95"
+                onClick={() => onPhraseClick(phrase)}
+              >
+                <span className="text-2xl">{phrase.emoji}</span>
+                <span className="text-base font-black leading-5 text-slate-900">
+                  {phrase.text}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : (
+        <section className="rounded-[2rem] border border-orange-100 bg-white p-4 shadow-soft">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
+            {quickPhrases.map((phrase) => (
+              <button
+                key={phrase.text}
+                type="button"
+                className="flex min-h-20 items-center gap-2 rounded-[1.25rem] border-2 border-orange-200 bg-gradient-to-br from-orange-50 via-white to-amber-100 p-3 text-right shadow-sm transition hover:-translate-y-0.5 active:scale-95"
+                onClick={() => onPhraseClick(phrase)}
+              >
+                <span className="text-2xl">{phrase.emoji}</span>
+                <span className="text-base font-black leading-5 text-slate-900">
+                  {phrase.text}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="rounded-[2rem] border border-emerald-100 bg-white p-4 shadow-soft">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          {allCategories
+            .filter((category) => enabledCategoryIds.includes(category.id))
+            .map((category) => (
+              <CategoryTile
+                key={category.id}
+                category={category}
+                onClick={() => onCategoryClick(category.id)}
+              />
+            ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function CategoryView({
+  categoryId,
+  allCategories,
+  symbols: categorySymbols,
+  symbolImages,
+  tileSize,
+  onBack,
+  onSymbolClick,
+}: {
+  categoryId: string;
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  symbols: AacSymbol[];
+  symbolImages: Record<string, string>;
+  tileSize: string;
+  onBack: () => void;
+  onSymbolClick: (symbolId: string) => void;
+}) {
+  const category = allCategories.find((item) => item.id === categoryId);
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="mb-4 flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded-xl border-2 border-slate-900 bg-white px-5 py-3 font-black shadow-sm"
+          onClick={onBack}
+        >
+          חזרה
+        </button>
+        <h2 className="text-2xl font-black text-slate-950">
+          {category?.emoji} {category?.label}
+        </h2>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-xl bg-slate-950 p-2">
+        <div className="grid grid-cols-3 gap-1 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 xl:grid-cols-9">
+          {categorySymbols.map((symbol) => (
+            <SymbolTile
+              key={symbol.id}
+              symbol={symbol}
+              imageUrl={resolveSymbolImage(symbol, symbolImages)}
+              className={tileSize}
+              variant="board"
+              onClick={() => onSymbolClick(symbol.id)}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KeyboardView({
+  onBack,
+  onSpeak,
+  onAddToSentence,
+}: {
+  onBack: () => void;
+  onSpeak: (text: string) => void;
+  onAddToSentence: (text: string) => boolean;
+}) {
+  const [draft, setDraft] = useState("");
+
+  const setSafeDraft = (value: string): void => {
+    const next = value.slice(0, MAX_TYPED_CHARS);
+    if (next.endsWith(" ") && !draft.endsWith(" ")) {
+      const finishedWord = next.trim().split(" ").pop();
+      if (finishedWord) onSpeak(finishedWord);
+    }
+    setDraft(next);
+  };
+
+  const appendLetter = (letter: string): void => {
+    const next = (draft + letter).slice(0, MAX_TYPED_CHARS);
+    if (letter === " " && !draft.endsWith(" ")) {
+      const finishedWord = draft.trim().split(" ").pop();
+      if (finishedWord) onSpeak(finishedWord);
+    }
+    setDraft(next);
+  };
+
+  const currentWordPrefix = draft.split(" ").pop() ?? "";
+  const wordPredictions = getWordPredictions(currentWordPrefix);
+
+  const applyWordPrediction = (word: string): void => {
+    onSpeak(word);
+    setDraft((current) => {
+      const parts = current.split(" ");
+      parts[parts.length - 1] = word;
+      return `${parts.join(" ")} `.slice(0, MAX_TYPED_CHARS);
+    });
+  };
+
+  const speakDraft = (): void => {
+    const trimmed = sanitizeTypedText(draft);
+    if (!trimmed) return;
+    onSpeak(trimmed);
+  };
+
+  const addDraft = (): void => {
+    if (onAddToSentence(draft)) {
+      setDraft("");
+    }
+  };
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="mb-3 flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded-full border border-slate-200 bg-white px-5 py-3 font-black shadow-sm"
+          onClick={onBack}
+        >
+          חזרה
+        </button>
+        <div>
+          <h2 className="text-2xl font-black sm:text-3xl">⌨️ מקלדת</h2>
+          <p className="text-muted">הקלידו מילה או משפט, ואז הקראה או הוספה למשפט.</p>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <input
+          dir="rtl"
+          lang="he"
+          autoComplete="off"
+          maxLength={MAX_TYPED_CHARS}
+          className="mb-3 min-h-16 w-full rounded-2xl border-4 border-sky-200 bg-white px-4 text-2xl font-black shadow-inner"
+          value={draft}
+          onChange={(event) => setSafeDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              addDraft();
+            }
+          }}
+          placeholder="הקלידו כאן..."
+          aria-label="טקסט מוקלד"
+        />
+
+        {wordPredictions.length > 0 && (
+          <div className="mb-3 flex flex-wrap gap-1.5" dir="rtl">
+            {wordPredictions.map((word) => (
+              <button
+                key={word}
+                type="button"
+                className="rounded-xl border-2 border-slate-900 bg-sky-100 px-3 py-2 text-sm font-black text-slate-950 shadow-sm active:scale-95"
+                onClick={() => applyWordPrediction(word)}
+              >
+                {word}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="mb-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="rounded-2xl bg-blue-600 px-5 py-3 font-black text-white shadow-sm"
+            onClick={speakDraft}
+          >
+            🔊 הקרא
+          </button>
+          <button
+            type="button"
+            className="rounded-2xl bg-emerald-500 px-5 py-3 font-black text-white shadow-sm"
+            onClick={addDraft}
+          >
+            הוסף למשפט
+          </button>
+          <button
+            type="button"
+            className="rounded-2xl border-2 border-slate-900 bg-white px-5 py-3 font-black shadow-sm"
+            onClick={() => setDraft((current) => current.slice(0, -1))}
+          >
+            ⌫ מחק אות
+          </button>
+          <button
+            type="button"
+            className="rounded-2xl border-2 border-red-200 bg-red-50 px-5 py-3 font-black text-red-800 shadow-sm"
+            onClick={() => setDraft("")}
+          >
+            נקה
+          </button>
+        </div>
+
+        <div className="space-y-1.5 rounded-2xl bg-slate-950 p-2" dir="rtl">
+          {hebrewKeyboardRows.map((row) => (
+            <div key={row.join("")} className="flex justify-center gap-1">
+              {row.map((letter) => (
+                <button
+                  key={letter}
+                  type="button"
+                  className="min-h-12 min-w-0 flex-1 rounded-xl border-2 border-slate-900 bg-sky-100 text-xl font-black text-slate-950 shadow-sm active:scale-95 sm:min-h-14 sm:text-2xl"
+                  onClick={() => appendLetter(letter)}
+                >
+                  {letter}
+                </button>
+              ))}
+            </div>
+          ))}
+          <div className="flex gap-1">
+            <button
+              type="button"
+              className="min-h-12 flex-[2] rounded-xl border-2 border-slate-900 bg-white text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
+              onClick={() => appendLetter(" ")}
+            >
+              רווח
+            </button>
+            <button
+              type="button"
+              className="min-h-12 flex-1 rounded-xl border-2 border-slate-900 bg-amber-200 text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
+              onClick={() => setDraft((current) => current.slice(0, -1))}
+            >
+              ⌫
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChildEventsView({
+  eventsThisWeek,
+  activeTopic,
+  topicSymbols,
+  symbolImages,
+  onSymbolClick,
+  onBack,
+  onPromptClick,
+  onPhraseClick,
+}: {
+  eventsThisWeek: CalendarEvent[];
+  activeTopic: { id: string; label: string; emoji: string } | undefined;
+  topicSymbols: AacSymbol[];
+  symbolImages: Record<string, string>;
+  onSymbolClick: (symbolId: string) => void;
+  onBack: () => void;
+  onPromptClick: (prompt: string) => void;
+  onPhraseClick: (phrase: string) => void;
+}) {
+  const [showTopicPanel, setShowTopicPanel] = useState(false);
+
+  const sortedEvents = [...eventsThisWeek].sort(
+    (left, right) => Math.abs(daysFromToday(left.date)) - Math.abs(daysFromToday(right.date)),
+  );
+
+  const topicSentences = activeTopic ? getWeeklyTopicSentences(activeTopic.id) : [];
+
+  return (
+    <div className="flex min-h-full flex-col">
+      <div className="mb-5 flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded-full border border-slate-200 bg-white px-5 py-3 font-black shadow-sm"
+          onClick={onBack}
+        >
+          חזרה
+        </button>
+        <div>
+          <h2 className="text-3xl font-black">🗓️ לוח אירועים</h2>
+          <p className="text-muted">שאלות ומשפטים לפי מה שקורה היום, לפני אירוע או אחרי אירוע.</p>
+        </div>
+      </div>
+
+      {activeTopic && (
+        <button
+          type="button"
+          className={`mb-4 flex shrink-0 items-center gap-2 self-start rounded-2xl border-2 px-4 py-3 font-black shadow-sm ${
+            showTopicPanel
+              ? "border-violet-600 bg-violet-600 text-white"
+              : "border-violet-300 bg-violet-50 text-violet-950"
+          }`}
+          onClick={() => setShowTopicPanel((current) => !current)}
+        >
+          <span className="text-2xl">{activeTopic.emoji}</span>
+          נושא השבוע: {activeTopic.label}
+        </button>
+      )}
+
+      {showTopicPanel && topicSymbols.length > 0 && (
+        <div className="mb-4 grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6">
+          {topicSymbols.map((symbol) => (
+            <SymbolTile
+              key={`topic-symbol-${symbol.id}`}
+              symbol={symbol}
+              imageUrl={resolveSymbolImage(symbol, symbolImages)}
+              variant="home"
+              onClick={() => onSymbolClick(symbol.id)}
+            />
+          ))}
+        </div>
+      )}
+
+      {showTopicPanel && (
+        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {topicSentences.map((sentence, index) => (
+            <button
+              key={`topic-${sentence.text}-${index}`}
+              type="button"
+              className="flex min-h-24 items-center gap-4 rounded-soft border border-violet-200 bg-white p-5 text-right shadow-sm"
+              onClick={() => onPhraseClick(sentence.text)}
+            >
+              <span className="text-4xl">{sentence.emoji}</span>
+              <span className="text-xl font-black">{sentence.text}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {sortedEvents.length === 0 && (
+        <p className="mb-3 text-sm font-black text-muted">אין אירועים השבוע</p>
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {sortedEvents.map((event) => {
+          const distance = daysFromToday(event.date);
+          const when =
+            distance === 0
+              ? "היום"
+              : distance > 0
+                ? `בעוד ${distance} ימים`
+                : `לפני ${Math.abs(distance)} ימים`;
+          const prompts = getEventPrompts(event);
+
+          return (
+            <article
+              key={event.id}
+              className="rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm"
+            >
+              <div className="mb-4 flex items-center gap-3">
+                <span className="grid h-16 w-16 place-items-center rounded-2xl bg-blue-50 text-4xl">
+                  {eventLabels[event.type].emoji}
+                </span>
+                <div>
+                  <h3 className="text-2xl font-black">{event.title}</h3>
+                  <p className="text-muted">
+                    {eventLabels[event.type].label} · {when}
+                  </p>
+                </div>
+              </div>
+              <div className="grid gap-2">
+                {prompts.map((prompt) => (
+                  <button
+                    key={prompt}
+                    type="button"
+                    className="flex w-full items-center gap-4 rounded-2xl bg-amber-50 p-4 text-right shadow-sm"
+                    onClick={() => onPromptClick(prompt)}
+                  >
+                    <span className="text-3xl">💬</span>
+                    <span className="text-lg font-black">{prompt}</span>
+                    <span className="mr-auto text-2xl">🔊</span>
+                  </button>
+                ))}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+async function loadAiStory(avoidTitles: string[]): Promise<Story | null> {
+  try {
+    const response = await fetch("/api/story-game", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ avoidTitles }),
+      // Short on purpose: if the AI is slow or blocked, the child gets a
+      // ready-made story instead of waiting.
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = (await readJsonResponse(response)) as { story?: unknown };
+    return data.story ? parseStory(data.story) : null;
+  } catch {
+    return null;
+  }
+}
+
+function StoryGameView({
+  onBack,
+  onSpeak,
+}: {
+  onBack: () => void;
+  onSpeak: (text: string, onEnd?: () => void) => void;
+}) {
+  const [story, setStory] = useState<Story>(() => pickLocalStory());
+  const [stepIndex, setStepIndex] = useState(0);
+  // True once the current step's word was picked, while its full sentence is read.
+  const [stepAnswered, setStepAnswered] = useState(false);
+  // Whether the child picked a wrong word on this step before the right one.
+  const [stepHadMistake, setStepHadMistake] = useState(false);
+  const [choices, setChoices] = useState<StoryChoice[]>([]);
+  const [narrating, setNarrating] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [isLoadingNext, setIsLoadingNext] = useState(false);
+  const [playedTitles, setPlayedTitles] = useState<string[]>([]);
+
+  const playStep = (index: number, current: Story): void => {
+    const step = current.steps[index];
+    setStepAnswered(false);
+    setStepHadMistake(false);
+    if (!step) {
+      setStepIndex(current.steps.length);
+      setNarrating(false);
+      setFinished(true);
+      window.setTimeout(() => onSpeak(STORY_ENDING_LINE), 300);
+      return;
+    }
+    setStepIndex(index);
+    setChoices(storyStepChoices(step));
+    setFeedback("");
+    setNarrating(true);
+    onSpeak(step.before, () => setNarrating(false));
+  };
+
+  const startStory = (next: Story): void => {
+    setStory(next);
+    setStepIndex(0);
+    setStepAnswered(false);
+    setFinished(false);
+    setFeedback("");
+    setPlayedTitles((current) => [...current, next.title].slice(-10));
+    // Title first, then the first sentence.
+    setNarrating(true);
+    onSpeak(next.title, () => playStep(0, next));
+  };
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => startStory(story), 400);
+    return () => window.clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handlePick = (choice: StoryChoice): void => {
+    if (narrating || finished || stepAnswered) return;
+    const step = story.steps[stepIndex];
+    if (!step) return;
+
+    if (choice.kind !== "correct") {
+      setStepHadMistake(true);
+      setFeedback(STORY_FEEDBACK.wrong);
+      onSpeak(STORY_FEEDBACK.wrong);
+      return;
+    }
+
+    setFeedback(STORY_FEEDBACK.correct);
+    setStepAnswered(true);
+    setNarrating(true);
+    // Right on the first try: just continue the sentence the child already
+    // heard. After a mistake (and the "try again" message in between), read
+    // the whole corrected sentence so it's heard together.
+    const toRead = stepHadMistake ? storyStepSentence(step) : storyStepContinuation(step);
+    onSpeak(toRead, () => playStep(stepIndex + 1, story));
+  };
+
+  // One "new story" button: a fresh AI-written story when the AI answers,
+  // otherwise (offline, blocked, slow) one of the ready-made stories.
+  const startNextStory = async (): Promise<void> => {
+    setIsLoadingNext(true);
+    const next = await loadAiStory(playedTitles);
+    setIsLoadingNext(false);
+    startStory(next ?? pickLocalStory(story.id));
+  };
+
+  // Completed steps show their full sentence; the current one shows the
+  // blank; later steps stay hidden so the story unfolds as it's told.
+  const completedSteps = finished ? story.steps.length : stepIndex + (stepAnswered ? 1 : 0);
+  const currentStep = !finished && !stepAnswered ? story.steps[stepIndex] : undefined;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="mb-5 flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded-full border border-slate-200 bg-white px-5 py-3 font-black shadow-sm"
+          onClick={onBack}
+        >
+          חזרה
+        </button>
+        <div>
+          <h2 className="text-3xl font-black">📖 בואו נספר סיפור</h2>
+          <p className="text-muted">הקשיבו לסיפור, ובכל פעם שחסרה מילה בחרו את המילה שממשיכה אותו.</p>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="mb-6 rounded-soft border border-slate-200 bg-white p-5">
+          <h3 className="mb-3 text-2xl font-black">
+            {story.emoji} {story.title}
+          </h3>
+          <div className="space-y-2 text-xl font-black leading-relaxed">
+            {story.steps.slice(0, completedSteps).map((step, index) => (
+              <p key={`${story.id}-${index}`}>
+                <span className="ml-2">{step.answer.emoji}</span>
+                {storyStepSentence(step)}
+              </p>
+            ))}
+            {currentStep && (
+              <p className="text-slate-700">
+                {currentStep.before} <span className="text-blue-500 underline">____</span>{" "}
+                {currentStep.after}
+              </p>
+            )}
+            {finished && <p className="pt-2 text-blue-700">{STORY_ENDING_LINE}</p>}
+          </div>
+          {!finished && (
+            <p className="mt-3 text-sm font-bold text-muted">
+              שלב {Math.min(stepIndex + 1, story.steps.length)} מתוך {story.steps.length}
+            </p>
+          )}
+        </div>
+
+        {finished ? (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              disabled={isLoadingNext}
+              className="rounded-2xl bg-blue-600 px-6 py-4 text-xl font-black text-white disabled:opacity-60"
+              onClick={() => void startNextStory()}
+            >
+              {isLoadingNext ? "📖 מכינים סיפור חדש..." : "🔄 סיפור חדש"}
+            </button>
+          </div>
+        ) : narrating || !currentStep ? (
+          <p className="text-lg font-black text-muted">🔊 מקריא/ה את הסיפור...</p>
+        ) : (
+          <>
+            <div className="grid gap-4 sm:grid-cols-3">
+              {choices.map((choice) => (
+                <button
+                  key={`${stepIndex}-${choice.word.label}`}
+                  type="button"
+                  className="flex min-h-32 flex-col items-center justify-center gap-2 rounded-soft border border-slate-200 bg-white p-5 shadow-sm transition active:scale-95"
+                  onClick={() => handlePick(choice)}
+                >
+                  <span className="text-5xl">{choice.word.emoji}</span>
+                  <span className="text-xl font-black">{choice.word.label}</span>
+                </button>
+              ))}
+            </div>
+            {feedback ? (
+              <p className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-lg font-black text-amber-950">
+                {feedback}
+              </p>
+            ) : null}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Aided language modeling: instead of forcing the child to type or speak every
+// turn, offer a few tappable replies matching what the assistant just said.
+const getQuickReplyOptions = (lastAssistantContent: string): string[] =>
+  lastAssistantContent.includes("?")
+    ? ["כן", "לא", "אולי"]
+    : ["ספרו לי עוד", "זהו, סיימתי", "יש לי שאלה"];
+
+function VoiceAssistantView({
+  onBack,
+  onSpeak,
+  speechRate,
+}: {
+  onBack: () => void;
+  onSpeak: (text: string) => void;
+  speechRate: number;
+}) {
+  const [message, setMessage] = useState("");
+  const [messages, setMessages] = useState<AiChatMessage[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      content: "שלום, אני כאן כדי לדבר איתך. מה תרצי לספר לי?",
+    },
+  ]);
+  const [answer, setAnswer] = useState("שלום, אני כאן כדי לדבר איתך. מה תרצי לספר לי?");
+  const [isRecording, setIsRecording] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [speechHint, setSpeechHint] = useState("");
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const recordingStartedAtRef = useRef<number>(0);
+  const replyAudioRef = useRef<HTMLAudioElement | null>(null);
+  const openAiSpeechBlockedRef = useRef(false);
+
+  const speakReply = async (rawText: string): Promise<void> => {
+    const text = stripEmoji(rawText);
+    if (!text) return;
+
+    if (!openAiSpeechBlockedRef.current) {
+      try {
+        const response = await fetch("/api/text-to-speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+
+        if (response.ok) {
+          window.speechSynthesis.cancel();
+          replyAudioRef.current?.pause();
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          replyAudioRef.current = audio;
+          audio.onended = () => URL.revokeObjectURL(url);
+          try {
+            await audio.play();
+            return;
+          } catch {
+            URL.revokeObjectURL(url);
+          }
+        }
+
+        const data = (await response.json()) as { detail?: string; error?: string };
+        if (isOpenAiQuotaError(`${data.error ?? ""} ${data.detail ?? ""}`)) {
+          openAiSpeechBlockedRef.current = true;
+        }
+      } catch {
+        // fall through to browser speech
+      }
+    }
+
+    speakHebrew(text, speechRate);
+  };
+
+  const appendAssistantMessage = (content: string): void => {
+    setAnswer(content);
+    setMessages((current) => [
+      ...current,
+      {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        content,
+      },
+    ]);
+    void speakReply(content);
+  };
+
+  const answerChild = async (text: string): Promise<void> => {
+    const cleanText = text.trim();
+    if (!cleanText) {
+      const emptyAnswer = "אפשר לכתוב לי משפט קצר, ואני אמשיך איתך את השיחה.";
+      setAnswer(emptyAnswer);
+      setMessages((current) => [
+        ...current,
+        {
+          id: `assistant-empty-${Date.now()}`,
+          role: "assistant",
+          content: emptyAnswer,
+        },
+      ]);
+      void speakReply(emptyAnswer);
+      return;
+    }
+
+    const userMessage: AiChatMessage = {
+      id: `user-${Date.now()}`,
+      role: "user",
+      content: cleanText,
+    };
+    const historyForRequest = messages.map((item) => ({
+      role: item.role,
+      content: item.content,
+    }));
+
+    setMessages((current) => [...current, userMessage]);
+    setMessage("");
+    setIsThinking(true);
+
+    try {
+      const response = await fetch("/api/child-ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: cleanText,
+          history: historyForRequest,
+        }),
+      });
+      const data = response.ok ? ((await response.json()) as ChildAiResponse) : {};
+      if (data.provider === "local") {
+        const hint = data.error ? aiApiErrorMessage(data.error) : "";
+        setSpeechHint(
+          hint ||
+            "מצב בסיסי: AI בענן לא זמין. התשובות מוגבלות — נס/י Ollama מקומי או מפתח Groq/Gemini.",
+        );
+      } else if (data.error) {
+        const hint = aiApiErrorMessage(data.error);
+        if (hint) setSpeechHint(hint);
+      } else {
+        setSpeechHint("");
+      }
+      const nextAnswer =
+        data.answer?.trim() || buildLocalChildAiAnswer(cleanText, [...messages, userMessage]);
+      const assistantMessage: AiChatMessage = {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        content: nextAnswer,
+      };
+
+      setMessages((current) => [...current, assistantMessage]);
+      setAnswer(nextAnswer);
+      void speakReply(nextAnswer);
+    } catch {
+      const fallback = buildLocalChildAiAnswer(cleanText, [...messages, userMessage]);
+      const assistantMessage: AiChatMessage = {
+        id: `assistant-fallback-${Date.now()}`,
+        role: "assistant",
+        content: fallback,
+      };
+      setMessages((current) => [...current, assistantMessage]);
+      setAnswer(fallback);
+      void speakReply(fallback);
+    } finally {
+      setIsThinking(false);
+    }
+  };
+
+  const stopRecording = (): void => {
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.stop();
+      return;
+    }
+
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const startBrowserSpeechRecognition = (): boolean => {
+    const recognition = getSpeechRecognition();
+    if (!recognition) return false;
+
+    recognition.onresult = (event) => {
+      const transcript = pickBestTranscript(event.results);
+      if (!transcript) return;
+
+      setMessage(transcript);
+      setSpeechHint("בדק/י את הטקסט, תקנ/י אם צריך, ולחצ/י שלח.");
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === "aborted") return;
+      if (event.error === "no-speech") {
+        setSpeechHint("לא שמעתי דיבור. דבר/י קרוב יותר למיקרופון ונס/י שוב.");
+        return;
+      }
+      setSpeechHint("זיהוי דיבור בדפדפן נכשל. נס/י שוב או כתב/י את המשפט.");
+    };
+
+    recognition.onend = () => {
+      speechRecognitionRef.current = null;
+      setIsRecording(false);
+    };
+
+    try {
+      speechRecognitionRef.current = recognition;
+      recordingStartedAtRef.current = Date.now();
+      recognition.start();
+      return true;
+    } catch {
+      speechRecognitionRef.current = null;
+      return false;
+    }
+  };
+
+  const startRecording = async (): Promise<void> => {
+    if (isRecording || isThinking) return;
+
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      appendAssistantMessage("הדפדפן לא תומך בהקלטת דיבור. כתב/י את המשפט ולחצ/י שלח.");
+      setSpeechHint("הקלטה לא נתמכת");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: { ideal: 44100 },
+        },
+      });
+      micStreamRef.current = stream;
+      audioChunksRef.current = [];
+      recordingStartedAtRef.current = Date.now();
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "audio/mp4";
+
+      const recorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: 128000,
+      });
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        micStreamRef.current?.getTracks().forEach((track) => track.stop());
+        micStreamRef.current = null;
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+
+        const recordingMs = Date.now() - recordingStartedAtRef.current;
+        if (recordingMs < MIN_RECORDING_MS) {
+          setSpeechHint("ההקלטה קצרה מדי. לחצ/י שוב ודבר/י לפחות שנייה.");
+          return;
+        }
+
+        setSpeechHint("מעבד את הדיבור...");
+
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        audioChunksRef.current = [];
+
+        if (blob.size === 0) {
+          setSpeechHint("לא נקלט דיבור. לחצ/י שוב על התחלת דיבור ודבר/י.");
+          return;
+        }
+
+        void (async () => {
+          try {
+            let uploadBlob: Blob = blob;
+            let fileName = `speech.${audioExtensionForMime(mimeType)}`;
+
+            try {
+              uploadBlob = await recordingToWavBlob(blob);
+              fileName = "speech.wav";
+            } catch {
+              // keep original recording for cloud fallbacks
+            }
+
+            const formData = new FormData();
+            formData.append("audio", uploadBlob, fileName);
+
+            const response = await fetch("/api/speech-to-text", {
+              method: "POST",
+              body: formData,
+            });
+            const data = (await response.json()) as {
+              text?: string;
+              error?: string;
+              detail?: string;
+            };
+
+            if (!response.ok || !data.text?.trim()) {
+              const combined = `${data.error ?? ""} ${data.detail ?? ""}`;
+              if (isOpenAiQuotaError(combined)) {
+                setSpeechHint(`${openAiQuotaMessage}, ורעננ/י את הדף. אפשר גם לכתוב את המשפט.`);
+                return;
+              }
+              setSpeechHint(speechApiErrorMessage(data.error, data.detail));
+              return;
+            }
+
+            setMessage(data.text);
+            setSpeechHint("בדק/י את הטקסט, תקנ/י אם צריך, ולחצ/י שלח.");
+          } catch {
+            setSpeechHint("שגיאה בשליחת הדיבור. נס/י לכתוב וללחוץ שלח.");
+          }
+        })();
+      };
+
+      recorder.start(250);
+      setIsRecording(true);
+      setSpeechHint("מקליט... דבר/י, ואז לחצ/י סיום דיבור");
+    } catch {
+      appendAssistantMessage(
+        "צריך לאשר מיקרופון. לחצ/י על סמל המנעול ליד הכתובת, אשר/י מיקרופון, ואז נס/י שוב.",
+      );
+      setSpeechHint("מיקרופון לא מאושר");
+    }
+  };
+
+  const toggleSpeech = (): void => {
+    if (isRecording) {
+      stopRecording();
+      return;
+    }
+    void startRecording();
+  };
+
+  const lastAssistantMessage = [...messages].reverse().find((item) => item.role === "assistant");
+  const quickReplyOptions = lastAssistantMessage
+    ? getQuickReplyOptions(lastAssistantMessage.content)
+    : [];
+
+  return (
+    <div className="flex min-h-full flex-col">
+      <div className="mb-5 flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded-full border border-slate-200 bg-white px-5 py-3 font-black shadow-sm"
+          onClick={onBack}
+        >
+          חזרה
+        </button>
+        <div>
+          <h2 className="text-3xl font-black">🗣️ שיחה חכמה</h2>
+          <p className="text-muted">
+            הילד מדבר או כותב, והמערכת עונה בקול בשפה פשוטה.
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[1fr_0.85fr]">
+        <section className="rounded-[2rem] border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="mb-4 space-y-3 rounded-[1.5rem] bg-slate-50 p-4">
+            {messages.map((item) => (
+              <div
+                key={item.id}
+                className={cx(
+                  "max-w-[88%] rounded-2xl px-4 py-3 text-lg font-bold leading-8 shadow-sm",
+                  item.role === "user"
+                    ? "mr-auto bg-blue-600 text-white"
+                    : "ml-auto bg-white text-slate-900",
+                )}
+              >
+                <span className="mb-1 block text-xs font-black opacity-70">
+                  {item.role === "user" ? "אני" : "החבר החכם"}
+                </span>
+                {item.content}
+              </div>
+            ))}
+            {isThinking && (
+              <div className="ml-auto flex max-w-[88%] items-center gap-2 rounded-2xl bg-white px-4 py-3 shadow-sm">
+                <span className="text-xl">🤔</span>
+                <span className="flex gap-1">
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400" />
+                </span>
+              </div>
+            )}
+          </div>
+
+          {!isThinking && quickReplyOptions.length > 0 && (
+            <div className="mb-4 flex flex-wrap gap-2">
+              {quickReplyOptions.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  className="rounded-full bg-blue-100 px-4 py-2 text-sm font-black text-blue-900 shadow-sm active:scale-95"
+                  onClick={() => {
+                    void answerChild(option);
+                  }}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <label className="mb-2 block text-sm font-black text-muted">
+            המשך שיחה
+          </label>
+          <textarea
+            className="min-h-36 w-full rounded-2xl border border-slate-200 p-4 text-xl"
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            placeholder="אפשר לכתוב חופשי, למשל: אני עצובה היום"
+          />
+          <div className="mt-4 flex flex-wrap gap-3">
+            <button
+              type="button"
+              className={cx("rounded-2xl px-6 py-4 text-lg font-black text-white shadow-soft disabled:opacity-60", isRecording ? "bg-red-500" : "bg-emerald-500")}
+              onClick={toggleSpeech}
+              disabled={isThinking}
+            >
+              {isRecording ? "⏹ סיום דיבור" : "🎤 התחלת דיבור"}
+            </button>
+            <button
+              type="button"
+              className="rounded-2xl bg-blue-500 px-6 py-4 text-lg font-black text-white shadow-soft"
+              onClick={() => {
+                void answerChild(message);
+              }}
+              disabled={isThinking}
+            >
+              {isThinking ? "חושב..." : "שלח"}
+            </button>
+          </div>
+          {speechHint && (
+            <p className="mt-3 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-bold leading-6 text-amber-900">
+              {speechHint}
+            </p>
+          )}
+          <p className="mt-3 text-sm text-muted">
+            דיבור עובד ב-Chrome/Edge עם אישור מיקרופון. אם לא עובד — כתבו ולחצו שלח.
+          </p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {["אני רוצה מים", "אני עייפה", "קשה לי", "אני רוצה לשחק"].map((starter) => (
+              <button
+                key={starter}
+                type="button"
+                className="rounded-full bg-slate-100 px-4 py-2 text-sm font-black text-slate-700"
+                onClick={() => {
+                  setMessage(starter);
+                  void answerChild(starter);
+                }}
+              >
+                {starter}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-[2rem] border border-emerald-100 bg-emerald-50 p-5 shadow-sm">
+          <h3 className="mb-3 text-xl font-black">התשובה האחרונה</h3>
+          <p className="rounded-2xl bg-white p-5 text-2xl font-black leading-10 shadow-sm">
+            {answer}
+          </p>
+          <button
+            type="button"
+            className="mt-4 rounded-2xl bg-slate-950 px-6 py-4 font-black text-white"
+            onClick={() => { void speakReply(answer); }}
+          >
+            הקרא שוב
+          </button>
+          <button
+            type="button"
+            className="mt-3 block rounded-2xl bg-white px-6 py-4 font-black text-slate-900 shadow-sm"
+            onClick={() => {
+              setMessages([
+                {
+                  id: `welcome-${Date.now()}`,
+                  role: "assistant",
+                  content: "פתחתי שיחה חדשה. על מה תרצי לדבר?",
+                },
+              ]);
+              setAnswer("פתחתי שיחה חדשה. על מה תרצי לדבר?");
+              setMessage("");
+            }}
+          >
+            שיחה חדשה
+          </button>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function SymbolTile({
+  symbol,
+  imageUrl,
+  className,
+  onClick,
+  variant = "board",
+}: {
+  symbol: AacSymbol;
+  imageUrl?: string;
+  className?: string;
+  onClick: () => void;
+  variant?: "board" | "home" | "keshet" | "keshet-people";
+}) {
+  const isKeshet = variant === "keshet" || variant === "keshet-people";
+  const isKeshetPeople = variant === "keshet-people";
+
+  return (
+    <button
+      type="button"
+      className={cx(
+        "text-center shadow-sm transition active:scale-95",
+        variant === "home"
+          ? "rounded-xl border-2 p-2 shadow-soft ring-1 ring-slate-900/5 hover:-translate-y-0.5"
+          : isKeshet
+            ? "flex min-h-[5.25rem] flex-col items-center justify-center overflow-hidden rounded-xl border-[3px] p-1 sm:min-h-[6rem] sm:p-1.5"
+            : "rounded-xl border-4 p-4",
+        symbolBackground(symbol),
+        className,
+      )}
+      onClick={onClick}
+    >
+      {imageUrl || symbol.pictogramId ? (
+        <img
+          src={imageUrl || arasaacImageUrl(symbol.pictogramId as number)}
+          alt={symbol.label}
+          className={cx(
+            "mx-auto object-cover",
+            imageUrl ? "rounded-full" : "rounded-md",
+            isKeshetPeople
+              ? "h-12 w-12 shrink-0 sm:h-14 sm:w-14"
+              : variant === "home"
+                ? "h-10 w-10 md:h-11 md:w-11"
+                : isKeshet
+                  ? "h-10 w-10 shrink-0 sm:h-12 sm:w-12"
+                  : "h-14 w-14 md:h-16 md:w-16",
+          )}
+        />
+      ) : (
+        <span
+          className={cx(
+            "block leading-none",
+            isKeshetPeople
+              ? "text-3xl sm:text-4xl"
+              : variant === "home"
+                ? "text-3xl md:text-4xl"
+                : isKeshet
+                  ? "text-3xl sm:text-4xl"
+                  : "text-5xl md:text-6xl",
+          )}
+        >
+          {symbol.emoji}
+        </span>
+      )}
+      <span
+        className={cx(
+          "block font-black text-slate-950",
+          isKeshet
+            ? "mt-1 text-xs leading-tight sm:text-sm"
+            : variant === "home"
+              ? "mt-1.5 text-sm leading-4 md:text-base"
+              : "mt-2 text-base leading-5 md:text-lg",
+        )}
+      >
+        {symbol.label}
+      </span>
+    </button>
+  );
+}
+
+function CategoryTile({
+  category,
+  onClick,
+}: {
+  category: { id: string; label: string; emoji: string };
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cx(
+        "min-h-24 rounded-[1.25rem] border-2 border-white p-3 text-center shadow-soft ring-1 ring-slate-900/5 transition hover:-translate-y-0.5 active:scale-95",
+        categoryIdBackground(category.id),
+      )}
+      onClick={onClick}
+    >
+      <span className="block text-3xl">{category.emoji}</span>
+      <span className="mt-1 block text-base font-black text-slate-950">{category.label}</span>
+    </button>
+  );
+}
+
+function categoryIdBackground(categoryId: string): string {
+  const backgrounds: Record<string, string> = {
+    core: "bg-gradient-to-br from-amber-50 to-amber-200",
+    feelings: "bg-gradient-to-br from-pink-50 to-pink-200",
+    food: "bg-gradient-to-br from-lime-50 to-lime-200",
+    people: "bg-gradient-to-br from-yellow-50 to-yellow-200",
+    actions: "bg-gradient-to-br from-emerald-50 to-emerald-200",
+    school: "bg-gradient-to-br from-cyan-50 to-cyan-200",
+    games: "bg-gradient-to-br from-violet-50 to-violet-200",
+  };
+
+  return backgrounds[categoryId] ?? "bg-gradient-to-br from-white to-slate-100";
+}
+
+// Each category's buttons get their own color, matching that row's label, so
+// a child can find "food" or "people" by color alone. Core words keep the
+// grammatical (Fitzgerald-key-style) coloring — they span every word type.
+const categoryTileColors: Record<string, string> = {
+  people: "border-yellow-400 bg-yellow-100",
+  feelings: "border-pink-400 bg-pink-100",
+  actions: "border-emerald-500 bg-emerald-100",
+  food: "border-orange-400 bg-orange-100",
+  school: "border-sky-400 bg-sky-100",
+  games: "border-violet-400 bg-violet-100",
+  // Neutral, so the color swatches themselves stand out.
+  colors: "border-slate-400 bg-white",
+};
+
+// Custom categories have no fixed color — pick a stable one from their id.
+const customCategoryPalette = [
+  { tile: "border-teal-400 bg-teal-100", label: "bg-teal-300 text-teal-950" },
+  { tile: "border-rose-400 bg-rose-100", label: "bg-rose-300 text-rose-950" },
+  { tile: "border-indigo-400 bg-indigo-100", label: "bg-indigo-300 text-indigo-950" },
+  { tile: "border-lime-500 bg-lime-100", label: "bg-lime-300 text-lime-950" },
+  { tile: "border-cyan-400 bg-cyan-100", label: "bg-cyan-300 text-cyan-950" },
+  { tile: "border-amber-500 bg-amber-100", label: "bg-amber-300 text-amber-950" },
+];
+
+const customCategoryColors = (categoryId: string) => {
+  const hash = [...categoryId].reduce((total, char) => total + char.charCodeAt(0), 0);
+  return customCategoryPalette[hash % customCategoryPalette.length];
+};
+
+const customCategoryLabelColor = (categoryId: string): string =>
+  customCategoryColors(categoryId).label;
+
+function symbolBackground(symbol: AacSymbol): string {
+  if (symbol.categoryId === "core") {
+    return symbol.wordType ? wordTypeColors[symbol.wordType] : "border-amber-400 bg-amber-100";
+  }
+  return categoryTileColors[symbol.categoryId] ?? customCategoryColors(symbol.categoryId).tile;
+}
+
+const openTeacherInviteMail = (input: {
+  teacherEmail: string;
+  teacherInviteCode: string;
+  childName: string;
+  parentName: string;
+  inviteeRole?: "parent" | "teacher";
+}): void => {
+  const { mailtoUrl } = buildTeacherInviteContent({
+    ...input,
+    appOrigin: window.location.origin,
+  });
+  window.location.href = mailtoUrl;
+};
+
+
+function ChildNameEditor({
+  activeChildName,
+  isRegisteredInSupabase,
+  onSave,
+}: {
+  activeChildName: string;
+  isRegisteredInSupabase: boolean;
+  onSave: (name: string) => Promise<void>;
+}) {
+  const [draftName, setDraftName] = useState(activeChildName);
+  const [message, setMessage] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    setDraftName(activeChildName);
+  }, [activeChildName]);
+
+  return (
+    <div className="mb-6 rounded-soft border border-violet-100 bg-violet-50 p-5 shadow-sm">
+      <h2 className="text-xl font-black">שם הילד/ה המיוחד/ת</h2>
+      <p className="mt-1 text-sm text-muted">ההורה והמורה יכולים לבחור את השם שמופיע במסך הילד.</p>
+      <div className="mt-4 flex flex-wrap items-end gap-3">
+        <label className="min-w-56 flex-1">
+          <span className="mb-2 block text-sm font-black text-slate-700">שם הילד/ה</span>
+          <input
+            className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-lg font-black"
+            value={draftName}
+            onChange={(event) => setDraftName(event.target.value)}
+            placeholder="למשל: דניאל"
+          />
+        </label>
+        <button
+          type="button"
+          className="rounded-2xl bg-violet-600 px-5 py-3 font-black text-white disabled:opacity-60"
+          disabled={isSaving || !draftName.trim()}
+          onClick={() => {
+            setMessage("");
+            setIsSaving(true);
+            void onSave(draftName.trim())
+              .then(() => setMessage("השם נשמר."))
+              .catch((error: unknown) => {
+                setMessage(error instanceof Error ? error.message : "לא הצלחנו לשמור את השם.");
+              })
+              .finally(() => {
+                setIsSaving(false);
+              });
+          }}
+        >
+          {isSaving ? "שומר..." : "שמירת שם"}
+        </button>
+      </div>
+      {message && (
+        <p className="mt-3 rounded-2xl bg-white px-4 py-2 text-sm font-bold text-violet-900 shadow-sm">
+          {message}
+        </p>
+      )}
+      {isRegisteredInSupabase && (
+        <p className="mt-2 text-xs text-muted">השם נשמר גם ב-Supabase.</p>
+      )}
+    </div>
+  );
+}
+
+function Dashboard({
+  view,
+  state,
+  activeTopic,
+  allSymbols,
+  allCategories,
+  allSymbolById,
+  onViewChange,
+  onStateChange,
+  onRotateTeacherCode,
+  onSendTeacherInvite,
+  teacherEmail,
+  onTeacherEmailChange,
+  inviteMessage,
+  onActiveChildNameChange,
+  isChildDevice,
+  onChildDeviceChange,
+  onClose,
+}: {
+  view: DashboardView;
+  state: DemoState;
+  activeTopic: { id: string; label: string; emoji: string } | undefined;
+  allSymbols: AacSymbol[];
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allSymbolById: Record<string, AacSymbol>;
+  onViewChange: (view: DashboardView) => void;
+  onStateChange: (state: DemoState) => void;
+  onRotateTeacherCode: () => Promise<string | null>;
+  onSendTeacherInvite: (email: string, inviteeRole: "parent" | "teacher") => Promise<string>;
+  teacherEmail: string;
+  onTeacherEmailChange: (value: string) => void;
+  inviteMessage: string;
+  onActiveChildNameChange: (name: string) => Promise<void>;
+  isChildDevice: boolean;
+  onChildDeviceChange: (enabled: boolean) => void;
+  onClose: () => void;
+}) {
+  const [codeMessage, setCodeMessage] = useState("");
+  const [isRotatingCode, setIsRotatingCode] = useState(false);
+  const [isSendingInvite, setIsSendingInvite] = useState(false);
+  const [inviteeRole, setInviteeRole] = useState<"parent" | "teacher">(
+    state.dashboardRole === "teacher" ? "parent" : "teacher",
+  );
+  const inviteeLabel = inviteeRole === "teacher" ? "מורה" : "הורה";
+  const averageLength =
+    state.sentenceLengths.length === 0
+      ? "0.0"
+      : (
+          state.sentenceLengths.reduce((total, value) => total + value, 0) /
+          state.sentenceLengths.length
+        ).toFixed(1);
+  const nextEvent = state.events
+    .filter((event) => new Date(event.date).getTime() >= new Date(today()).getTime())
+    .sort((left, right) => new Date(left.date).getTime() - new Date(right.date).getTime())[0];
+
+  const update = (updater: (current: DemoState) => DemoState): void => {
+    onStateChange(updater(state));
+  };
+
+  return (
+    <main className="flex h-screen overflow-hidden">
+      <aside className="flex w-64 shrink-0 flex-col gap-2 overflow-y-auto border-l border-slate-200 bg-white p-4">
+        <div className="mb-4 px-2 text-2xl font-black">🧩 SmartAAC</div>
+        {[
+          ["overview", "📊", "סקירה"],
+          ["calendar", "🗓️", "לוח שנה"],
+          ["events", "📅", "אירועים"],
+          ["topic", "📚", "נושא שבועי"],
+          ["level", "🎚️", "רמת תפקוד"],
+          ["symbols", "🔣", "סמלים"],
+          ["library", "🌍", "ספרייה משותפת"],
+          ["progress", "📈", "התקדמות"],
+        ].map(([id, emoji, label]) => (
+          <button
+            key={id}
+            type="button"
+            className={cx(
+              "flex items-center gap-3 rounded-2xl px-4 py-3 text-right font-black text-muted",
+              view === id && "bg-blue-50 text-blue-600",
+            )}
+            onClick={() => onViewChange(id as DashboardView)}
+          >
+            <span>{emoji}</span>
+            <span>{label}</span>
+          </button>
+        ))}
+        <div className="flex-1" />
+        <button type="button" className="rounded-2xl bg-blue-500 px-4 py-3 font-black text-white" onClick={onClose}>
+          חזרה למסך הילד
+        </button>
+        <p className="px-2 text-[10px] leading-4 text-muted">
+          סמלי התקשורת: ARASAAC (arasaac.org), מאת Sergio Palao, בבעלות ממשלת
+          אראגון, ברישיון CC BY-NC-SA.
+        </p>
+      </aside>
+
+      <section className="flex-1 overflow-auto p-8">
+        {view === "overview" && (
+          <section>
+            <h1 className="text-3xl font-black">סקירה</h1>
+            <p className="mb-6 text-muted">לוח בקרה</p>
+            <ChildDevicePanel
+              enabled={isChildDevice}
+              childName={state.activeChildName}
+              onChange={onChildDeviceChange}
+            />
+            <ChildNameEditor
+              activeChildName={state.activeChildName}
+              isRegisteredInSupabase={state.isRegisteredInSupabase}
+              onSave={onActiveChildNameChange}
+            />
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <Metric label="ילד/ה פעיל/ה" value={state.activeChildName || "לא הוגדר"} />
+              <Metric label="רמת תפקוד" value={levelLabels[state.level]} />
+              <Metric label="נושא שבועי" value={`${activeTopic?.emoji ?? ""} ${activeTopic?.label ?? "-"}`} />
+              <Metric label="משפטים שנבנו" value={String(state.sentenceCount)} />
+            </div>
+            <div className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <Metric label="סמלים פעילים" value={String(allSymbols.length - state.hiddenSymbolIds.length)} />
+            </div>
+            <div className="mt-6 grid gap-4 xl:grid-cols-2">
+              <div className="rounded-soft border border-blue-100 bg-blue-50 p-5 shadow-sm">
+                <h2 className="text-xl font-black">
+                  {state.dashboardRole === "teacher" && !state.isProfileCreator
+                    ? "חיבור מורה"
+                    : "חיבור הורה ומורה"}
+                </h2>
+                {state.dashboardRole === "teacher" && !state.isProfileCreator ? (
+                  <>
+                    <p className="mt-2 text-muted">
+                      מחוברת כמורה · {state.connectedTeacherEmail || state.parentEmail || "לא הוגדר אימייל"}
+                    </p>
+                    <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
+                      <span className="block text-sm font-black text-muted">עובדת עכשיו עם</span>
+                      <span className="mt-1 block text-3xl font-black">{state.activeChildName || "—"}</span>
+                    </div>
+                    <span className="mt-3 inline-flex rounded-full bg-emerald-100 px-4 py-2 text-sm font-black text-emerald-800">
+                      {state.isRegisteredInSupabase ? "מחוברת לילד ב-Supabase" : "כניסה מקומית"}
+                    </span>
+                    {state.linkedChildren.length > 0 && (
+                      <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
+                        <span className="block text-sm font-black text-muted">כל הילדים שאת אחראית עליהם</span>
+                        <div className="mt-2 space-y-2">
+                          {state.linkedChildren.map((child) => (
+                            <div
+                              key={child.id}
+                              className={cx(
+                                "rounded-xl px-3 py-2 text-sm font-bold",
+                                child.id === state.supabaseChildId
+                                  ? "bg-emerald-100 text-emerald-900"
+                                  : "bg-slate-100 text-slate-700",
+                              )}
+                            >
+                              {child.name}
+                              {child.id === state.supabaseChildId ? " · פעיל/ה עכשיו" : ""}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <p className="mt-4 rounded-2xl bg-white p-4 text-sm leading-7 text-muted shadow-sm">
+                      בכל כניסה הזינ/י את קוד הילד — לפי הקוד המערכת יודעת על מי לעבוד. כך אפשר לנהל כמה ילדים.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="mt-2 text-muted">
+                      {state.parentName || (state.dashboardRole === "teacher" ? "מורה" : "הורה")} ·{" "}
+                      {state.parentEmail || "לא הוגדר אימייל"}
+                    </p>
+                    <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
+                      <span className="block text-sm font-black text-muted">אחראית על</span>
+                      <span className="mt-1 block text-3xl font-black">{state.activeChildName || "—"}</span>
+                    </div>
+                    <span
+                      className={cx(
+                        "mt-3 inline-flex rounded-full px-4 py-2 text-sm font-black",
+                        state.isRegisteredInSupabase
+                          ? "bg-emerald-100 text-emerald-800"
+                          : "bg-amber-100 text-amber-900",
+                      )}
+                    >
+                      {state.isRegisteredInSupabase
+                        ? "נשמר ב-Supabase"
+                        : "לא נשמר ב-Supabase (כניסה מקומית)"}
+                    </span>
+                    <div
+                      className={cx(
+                        "mt-4 rounded-2xl p-4 shadow-sm",
+                        state.pendingTeacherInvite ? "bg-amber-50 ring-2 ring-amber-200" : "bg-white",
+                      )}
+                    >
+                      <span className="block text-sm font-black text-muted">
+                        {state.pendingTeacherInvite
+                          ? "כניסה ראשונה — הזמינ/י הורה או מורה"
+                          : "הזמנת הורה או מורה"}
+                      </span>
+                      {state.pendingTeacherInvite && (
+                        <p className="mt-2 text-sm leading-7 text-amber-900">
+                          בחר/י את מי להזמין, הזינ/י אימייל ולחצ/י על הכפתור. המייל יכלול סיסמת גישה (קוד) וקישור לכניסה.
+                        </p>
+                      )}
+                      <div className="mt-3 grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1">
+                        {(["teacher", "parent"] as const).map((role) => (
+                          <button
+                            key={role}
+                            type="button"
+                            className={cx(
+                              "rounded-xl px-3 py-2 text-sm font-black text-slate-600",
+                              inviteeRole === role && "bg-white text-blue-700 shadow-sm",
+                            )}
+                            onClick={() => setInviteeRole(role)}
+                          >
+                            {role === "teacher" ? "להזמין מורה" : "להזמין הורה"}
+                          </button>
+                        ))}
+                      </div>
+                      <label className="mt-3 grid gap-1">
+                        <span className="text-xs font-black text-slate-600">אימייל של ה{inviteeLabel}</span>
+                        <input
+                          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-left"
+                          type="email"
+                          dir="ltr"
+                          value={teacherEmail}
+                          onChange={(event) => onTeacherEmailChange(event.target.value)}
+                          placeholder={inviteeRole === "teacher" ? "teacher@school.com" : "parent@email.com"}
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
+                      <span className="block text-sm font-black text-muted">סיסמת הגישה לילד/ה (קוד)</span>
+                      <span className="mt-1 block text-3xl font-black tracking-widest">
+                        {state.teacherInviteCode}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="mt-4 w-full rounded-2xl bg-emerald-600 px-5 py-3 font-black text-white disabled:opacity-60"
+                      disabled={isSendingInvite || !teacherEmail.trim()}
+                      onClick={() => {
+                        setCodeMessage("");
+                        setIsSendingInvite(true);
+                        void onSendTeacherInvite(teacherEmail.trim(), inviteeRole)
+                          .then((message) => setCodeMessage(message))
+                          .catch((error: unknown) => {
+                            setCodeMessage(
+                              error instanceof Error ? error.message : "לא הצלחנו לשלוח את ההזמנה.",
+                            );
+                          })
+                          .finally(() => {
+                            setIsSendingInvite(false);
+                          });
+                      }}
+                    >
+                      {isSendingInvite ? "שולח..." : `שלח/י ל${inviteeLabel} מייל עם סיסמת הגישה`}
+                    </button>
+                    <button
+                      type="button"
+                      className="mt-4 rounded-2xl bg-blue-600 px-5 py-3 font-black text-white disabled:opacity-60"
+                      disabled={isRotatingCode}
+                      onClick={() => {
+                        setCodeMessage("");
+                        setIsRotatingCode(true);
+                        void onRotateTeacherCode()
+                          .then((code) => {
+                            if (code) {
+                              setCodeMessage(`קוד חדש נשמר: ${code} — שלח/י אותו למי שתרצ/י להזמין.`);
+                            }
+                          })
+                          .catch((error: unknown) => {
+                            setCodeMessage(
+                              error instanceof Error ? error.message : "לא הצלחנו ליצור קוד חדש.",
+                            );
+                          })
+                          .finally(() => {
+                            setIsRotatingCode(false);
+                          });
+                      }}
+                    >
+                      {isRotatingCode ? "יוצר קוד..." : "צור קוד גישה חדש"}
+                    </button>
+                    {codeMessage && (
+                      <p className="mt-3 rounded-2xl bg-white p-3 text-sm font-bold text-blue-900 shadow-sm">
+                        {codeMessage}
+                      </p>
+                    )}
+                    {inviteMessage && (
+                      <p className="mt-3 rounded-2xl bg-emerald-50 p-3 text-sm font-bold text-emerald-900 shadow-sm">
+                        {inviteMessage}
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+              <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+                <h2 className="text-xl font-black">האירוע הקרוב</h2>
+                <p className="mt-2 text-muted">
+                  {nextEvent
+                    ? `${eventLabels[nextEvent.type].emoji} ${nextEvent.title} · ${nextEvent.date}`
+                    : "אין אירועים קרובים. אפשר להוסיף בלשונית אירועים."}
+                </p>
+              </div>
+              <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+                <h2 className="text-xl font-black">איך זה עובד?</h2>
+                <p className="mt-2 text-muted">
+                  ההורה מגדיר אירועים, נושא שבועי ורמת תפקוד. הילד רואה רק מסך תקשורת יציב עם הצעות עדינות.
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {view === "calendar" && (
+          <CalendarDashboard
+            events={state.events}
+            onDeleteEvent={(eventId) =>
+              update((current) => ({
+                ...current,
+                events: current.events.filter((event) => event.id !== eventId),
+              }))
+            }
+          />
+        )}
+        {view === "events" && <EventsDashboard state={state} update={update} />}
+        {view === "topic" && <TopicDashboard state={state} update={update} />}
+        {view === "level" && <LevelDashboard state={state} update={update} />}
+        {view === "symbols" && (
+          <SymbolsDashboard
+            state={state}
+            allSymbols={allSymbols}
+            allCategories={allCategories}
+            update={update}
+          />
+        )}
+
+        {view === "library" && (
+          <SharedLibraryDashboard state={state} allSymbols={allSymbols} update={update} />
+        )}
+        {view === "progress" && (
+          <ProgressDashboard
+            state={state}
+            activeTopic={activeTopic}
+            averageLength={averageLength}
+            allSymbolById={allSymbolById}
+            allCategories={allCategories}
+          />
+        )}
+      </section>
+    </main>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="text-sm font-black text-muted">{label}</div>
+      <div className="mt-2 text-3xl font-black">{value}</div>
+    </div>
+  );
+}
+
+function CalendarDashboard({
+  events,
+  onDeleteEvent,
+}: {
+  events: CalendarEvent[];
+  onDeleteEvent: (eventId: string) => void;
+}) {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const firstDay = new Date(year, month, 1);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const leadingEmptyDays = firstDay.getDay();
+  const monthLabel = new Intl.DateTimeFormat("he-IL", {
+    month: "long",
+    year: "numeric",
+  }).format(now);
+
+  const eventsByDate = events.reduce<Record<string, CalendarEvent[]>>((grouped, event) => {
+    grouped[event.date] = [...(grouped[event.date] ?? []), event];
+    return grouped;
+  }, {});
+
+  const cells: Array<{ day: number | null; dateKey: string | null }> = [
+    ...Array.from({ length: leadingEmptyDays }, () => ({ day: null, dateKey: null })),
+    ...Array.from({ length: daysInMonth }, (_, index) => {
+      const dayNumber = index + 1;
+      const date = new Date(year, month, dayNumber);
+      return {
+        day: dayNumber,
+        dateKey: date.toISOString().slice(0, 10),
+      };
+    }),
+  ];
+
+  return (
+    <section>
+      <h1 className="text-3xl font-black">לוח שנה</h1>
+      <p className="mb-6 text-muted">
+        הלוח מיועד להורה ולמטפל בלבד. הילד לא רואה יומן, אלא מקבל הצעות עדינות לפי האירועים.
+      </p>
+      <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="mb-5 flex items-center justify-between">
+          <h2 className="text-2xl font-black">{monthLabel}</h2>
+          <span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-black text-blue-700">
+            {events.length} אירועים
+          </span>
+        </div>
+        <div className="mb-2 grid grid-cols-7 gap-2 text-center text-sm font-black text-muted">
+          {["א", "ב", "ג", "ד", "ה", "ו", "ש"].map((day) => (
+            <div key={day}>{day}</div>
+          ))}
+        </div>
+        <div className="grid grid-cols-7 gap-2">
+          {cells.map((cell, index) => {
+            const dayEvents = cell.dateKey ? eventsByDate[cell.dateKey] ?? [] : [];
+            return (
+              <div
+                key={`${cell.dateKey ?? "empty"}-${index}`}
+                className={cx(
+                  "min-h-28 rounded-2xl border border-slate-100 bg-slate-50 p-2",
+                  dayEvents.length > 0 && "bg-blue-50 ring-2 ring-blue-100",
+                )}
+              >
+                {cell.day && <div className="mb-2 font-black">{cell.day}</div>}
+                <div className="space-y-1">
+                  {dayEvents.slice(0, 2).map((event) => (
+                    <div
+                      key={event.id}
+                      className="flex items-center gap-1 rounded-full bg-white px-2 py-1 text-xs font-bold"
+                    >
+                      <span className="truncate">
+                        {eventLabels[event.type].emoji} {event.title}
+                      </span>
+                      <button
+                        type="button"
+                        className="mr-auto rounded-full bg-red-50 px-1 text-red-700"
+                        onClick={() => onDeleteEvent(event.id)}
+                        aria-label={`מחק ${event.title}`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                  {dayEvents.length > 2 && (
+                    <div className="text-xs font-bold text-muted">+{dayEvents.length - 2}</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function EventsDashboard({
+  state,
+  update,
+}: {
+  state: DemoState;
+  update: (updater: (current: DemoState) => DemoState) => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [type, setType] = useState<CalendarEvent["type"]>("trip");
+  const [date, setDate] = useState(today());
+  const [formError, setFormError] = useState("");
+
+  const addEvent = (): void => {
+    const trimmedTitle = title.trim();
+    if (!trimmedTitle) {
+      setFormError("הזינ/י שם לאירוע.");
+      return;
+    }
+    if (!date) {
+      setFormError("בחר/י תאריך.");
+      return;
+    }
+
+    update((current) => ({
+      ...current,
+      events: [
+        ...current.events,
+        { id: createLocalId("event"), title: trimmedTitle, type, date },
+      ],
+    }));
+    setTitle("");
+    setFormError("");
+  };
+
+  return (
+    <section>
+      <h1 className="text-3xl font-black">אירועים</h1>
+      <p className="mb-6 text-muted">האירועים משפיעים על ההצעות, לא מוצגים לילד כלוח שנה.</p>
+
+      <div className="mb-6 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="mb-4 text-xl font-black">הוספת אירוע חדש</h2>
+        <div className="mb-4 grid gap-3 md:grid-cols-5">
+          {Object.entries(eventLabels).map(([id, item]) => (
+            <button
+              key={id}
+              type="button"
+            className={cx(
+              "rounded-2xl border p-4 text-center font-black",
+              type === id
+                ? "border-blue-500 bg-blue-500 text-white ring-4 ring-blue-100"
+                : "border-slate-200 bg-slate-50 text-slate-950",
+            )}
+              onClick={() => setType(id as CalendarEvent["type"])}
+            >
+              <span className="block text-3xl">{item.emoji}</span>
+              <span className="mt-2 block text-sm">{item.label}</span>
+            </button>
+          ))}
+        </div>
+        <div className="grid gap-3 lg:grid-cols-[1fr_220px_auto]">
+          <input
+            className="rounded-2xl border border-slate-200 px-4 py-3"
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder="שם האירוע, למשל: טיול לגן החיות"
+          />
+          <input
+            className="rounded-2xl border border-slate-200 px-4 py-3"
+            type="date"
+            value={date}
+            onChange={(event) => setDate(event.target.value)}
+          />
+          <button
+            type="button"
+            className="rounded-2xl bg-blue-500 px-5 py-3 font-black text-white"
+            onClick={addEvent}
+          >
+            הוספה
+          </button>
+        </div>
+        {formError && (
+          <p className="mt-3 rounded-2xl bg-red-100 px-4 py-2 text-sm font-black text-red-800">
+            {formError}
+          </p>
+        )}
+        <div className="mt-3 flex flex-wrap gap-2">
+          {[
+            ["היום", 0],
+            ["מחר", 1],
+            ["בעוד שבוע", 7],
+          ].map(([label, offset]) => (
+            <button
+              key={label}
+              type="button"
+              className="rounded-full bg-slate-100 px-4 py-2 text-sm font-black text-muted"
+              onClick={() => {
+                const nextDate = new Date();
+                nextDate.setDate(nextDate.getDate() + Number(offset));
+                setDate(nextDate.toISOString().slice(0, 10));
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-3">
+        {state.events.map((event) => (
+          <div key={event.id} className="flex items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4">
+            <span className="text-3xl">{eventLabels[event.type].emoji}</span>
+            <div className="flex-1">
+              <div className="font-black">{event.title}</div>
+              <div className="text-sm text-muted">
+                {eventLabels[event.type].label} · {event.date}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="rounded-2xl bg-red-50 px-4 py-2 font-black text-red-700"
+              onClick={() =>
+                update((current) => ({
+                  ...current,
+                  events: current.events.filter((item) => item.id !== event.id),
+                }))
+              }
+            >
+              מחק
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function TopicDashboard({
+  state,
+  update,
+}: {
+  state: DemoState;
+  update: (updater: (current: DemoState) => DemoState) => void;
+}) {
+  return (
+    <section>
+      <h1 className="text-3xl font-black">נושא שבועי</h1>
+      <p className="mb-6 text-muted">הנושא משפיע בעדינות על ההצעות במסך הילד.</p>
+      <div className="grid gap-4 md:grid-cols-4">
+        {weeklyTopics.map((topic) => {
+          const isSelected = state.weeklyTopicId === topic.id;
+
+          return (
+          <button
+            key={topic.id}
+            type="button"
+            className={cx(
+              "rounded-soft border p-5 text-center font-black shadow-sm",
+              isSelected
+                ? "border-blue-500 bg-blue-500 text-white"
+                : "border-slate-200 bg-white text-slate-950",
+            )}
+            onClick={() => update((current) => ({ ...current, weeklyTopicId: topic.id }))}
+          >
+            <span className="block text-4xl">{topic.emoji}</span>
+            <span className={cx("mt-2 block", isSelected ? "text-white" : "text-slate-950")}>
+              {topic.label}
+            </span>
+          </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function LevelDashboard({
+  state,
+  update,
+}: {
+  state: DemoState;
+  update: (updater: (current: DemoState) => DemoState) => void;
+}) {
+  const levels: Array<{ id: FunctionalityLevel; title: string; description: string }> = [
+    { id: "low", title: "נמוכה", description: "פחות סמלים, כפתורים גדולים, יותר משפטים מוכנים" },
+    { id: "medium", title: "בינונית", description: "שילוב בין משפטים מוכנים לבחירה חופשית" },
+    { id: "high", title: "גבוהה", description: "יותר סמלים ויותר עצמאות בבניית משפטים" },
+  ];
+
+  return (
+    <section>
+      <div className="mb-8 rounded-soft border border-violet-200 bg-violet-50 p-5 shadow-sm">
+        <h2 className="text-2xl font-black">✨ מתקן העברית</h2>
+        <p className="mt-1 text-muted">
+          הסמלים הם מילים בודדות ("אני רוצה מים קר"). המתקן הופך אותן למשפט תקין וטבעי ("אני רוצה
+          מים קרים") ומקריא אותו בלשון המתאימה לילד/ה.
+        </p>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <span className="font-black">הילד/ה:</span>
+          {(
+            [
+              ["boy", "👦 בן (אני עייף)"],
+              ["girl", "👧 בת (אני עייפה)"],
+            ] as const
+          ).map(([gender, label]) => (
+            <button
+              key={gender}
+              type="button"
+              className={cx(
+                "rounded-2xl border px-4 py-2 font-black",
+                (state.childGender ?? "boy") === gender
+                  ? "border-violet-600 bg-violet-600 text-white"
+                  : "border-violet-200 bg-white text-violet-950",
+              )}
+              onClick={() => update((current) => ({ ...current, childGender: gender }))}
+            >
+              {label}
+            </button>
+          ))}
+          <label className="mr-auto flex items-center gap-2 font-black">
+            <input
+              type="checkbox"
+              className="h-5 w-5"
+              checked={state.smartGrammar !== false}
+              onChange={(event) =>
+                update((current) => ({ ...current, smartGrammar: event.target.checked }))
+              }
+            />
+            תיקון משפטים חכם (AI)
+          </label>
+        </div>
+      </div>
+
+      <h1 className="text-3xl font-black">רמת תפקוד</h1>
+      <p className="mb-6 text-muted">הרמה נשלטת ידנית על ידי מטפל או הורה.</p>
+      <div className="grid gap-4 md:grid-cols-3">
+        {levels.map((level) => {
+          const isSelected = state.level === level.id;
+
+          return (
+          <button
+            key={level.id}
+            type="button"
+            className={cx(
+              "rounded-soft border p-5 text-right shadow-sm",
+              isSelected
+                ? "border-blue-500 bg-blue-500 text-white"
+                : "border-slate-200 bg-white text-slate-950",
+            )}
+            onClick={() => update((current) => ({ ...current, level: level.id }))}
+          >
+            <span className={cx("text-xl font-black", isSelected ? "text-white" : "text-slate-950")}>
+              {level.title}
+            </span>
+            <span className={cx("mt-2 block", isSelected ? "text-blue-50" : "text-slate-600")}>
+              {level.description}
+            </span>
+          </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-6 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="text-xl font-black">קצב דיבור</h2>
+        <p className="mb-3 text-muted">
+          כמה לאט או מהר המערכת מקריאה לילד/ה. לילדים שזקוקים לזמן עיבוד שמיעתי ארוך יותר — כדאי להאט.
+        </p>
+        <div className="flex items-center gap-4">
+          <span className="text-sm font-black text-muted">איטי</span>
+          <input
+            type="range"
+            min={0.5}
+            max={1.3}
+            step={0.05}
+            value={state.speechRate}
+            onChange={(event) =>
+              update((current) => ({ ...current, speechRate: Number(event.target.value) }))
+            }
+            className="w-full"
+            aria-label="קצב דיבור"
+          />
+          <span className="text-sm font-black text-muted">מהיר</span>
+        </div>
+        <button
+          type="button"
+          className="mt-3 rounded-2xl bg-blue-600 px-5 py-3 font-black text-white shadow-sm"
+          onClick={() => speakHebrew("שלום, ככה אני נשמע עכשיו", state.speechRate)}
+        >
+          🔊 נסה
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function PeopleManager({
+  state,
+  peopleSymbols,
+  update,
+  onUploadPhoto,
+  onRemovePhoto,
+  photoError,
+  onPhotoError,
+}: {
+  state: DemoState;
+  peopleSymbols: AacSymbol[];
+  update: (updater: (current: DemoState) => DemoState) => void;
+  onUploadPhoto: (symbolId: string, file: File) => Promise<void>;
+  onRemovePhoto: (symbolId: string) => void;
+  photoError: string;
+  onPhotoError: (message: string) => void;
+}) {
+  const peoplePresets = [
+    { key: "brother", hint: "אח", emoji: "👦" },
+    { key: "sister", hint: "אחות", emoji: "👧" },
+    { key: "friend", hint: "חבר/ה", emoji: "🧒" },
+    { key: "cousin", hint: "בן/בת דוד", emoji: "🧑" },
+    { key: "grandma", hint: "סבתא", emoji: "👵" },
+    { key: "grandpa", hint: "סבא", emoji: "👴" },
+    { key: "teacher", hint: "מורה", emoji: "👩‍🏫" },
+    { key: "therapist", hint: "מטפל/ת", emoji: "👩‍⚕️" },
+    { key: "other", hint: "אחר", emoji: "👤" },
+  ] as const;
+
+  const [selectedPreset, setSelectedPreset] = useState<(typeof peoplePresets)[number]["key"]>("brother");
+  const [newPersonName, setNewPersonName] = useState("");
+  const [newPersonImage, setNewPersonImage] = useState<string | undefined>(undefined);
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+
+  const selectedEmoji =
+    peoplePresets.find((preset) => preset.key === selectedPreset)?.emoji ?? "👤";
+
+  const savePersonName = (symbol: AacSymbol, name: string): void => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      onPhotoError("השם לא יכול להיות ריק.");
+      return;
+    }
+
+    onPhotoError("");
+    if (symbol.id.startsWith("custom-")) {
+      update((current) => ({
+        ...current,
+        customSymbols: current.customSymbols.map((item) =>
+          item.id === symbol.id ? { ...item, label: trimmed } : item,
+        ),
+      }));
+      return;
+    }
+
+    update((current) => ({
+      ...current,
+      symbolLabelOverrides: {
+        ...current.symbolLabelOverrides,
+        [symbol.id]: trimmed,
+      },
+    }));
+  };
+
+  const deletePerson = (symbolId: string): void => {
+    if (!symbolId.startsWith("custom-")) return;
+
+    update((current) => {
+      const nextImages = { ...current.symbolImages };
+      delete nextImages[symbolId];
+      const nextOverrides = { ...current.symbolLabelOverrides };
+      delete nextOverrides[symbolId];
+
+      return {
+        ...current,
+        customSymbols: current.customSymbols.filter((item) => item.id !== symbolId),
+        symbolImages: nextImages,
+        symbolLabelOverrides: nextOverrides,
+        hiddenSymbolIds: current.hiddenSymbolIds.filter((id) => id !== symbolId),
+        favoriteSymbolIds: current.favoriteSymbolIds.filter((id) => id !== symbolId),
+        coreSymbolIds: current.coreSymbolIds.filter((id) => id !== symbolId),
+      };
+    });
+  };
+
+  const addPerson = (): void => {
+    const name = newPersonName.trim();
+    if (!name) {
+      onPhotoError("הקליד/י שם — למשל: יוני, מיכל, דני.");
+      return;
+    }
+
+    const symbolId = `custom-person-${Date.now()}`;
+    update((current) => ({
+      ...current,
+      customSymbols: [
+        ...current.customSymbols,
+        {
+          id: symbolId,
+          label: name,
+          emoji: selectedEmoji,
+          categoryId: "people",
+        },
+      ],
+      symbolImages: newPersonImage
+        ? { ...current.symbolImages, [symbolId]: newPersonImage }
+        : current.symbolImages,
+      favoriteSymbolIds: current.favoriteSymbolIds.includes(symbolId)
+        ? current.favoriteSymbolIds
+        : [...current.favoriteSymbolIds, symbolId],
+    }));
+
+    setNewPersonName("");
+    setNewPersonImage(undefined);
+    onPhotoError("");
+  };
+
+  const getDraftName = (symbol: AacSymbol): string =>
+    nameDrafts[symbol.id] ?? symbol.label;
+
+  return (
+    <div className="mb-8 rounded-soft border border-yellow-100 bg-yellow-50/70 p-5 shadow-sm">
+      <h2 className="text-xl font-black">👪 משפחה, אחים, חברים ועוד</h2>
+      <p className="mt-1 text-muted">
+        הוסיפו אנשים עם שם אישי ותמונה. אפשר כמה אחים, אחיות וחברים.
+      </p>
+
+      <div className="mt-4">
+        <span className="mb-2 block text-sm font-black text-slate-700">סוג האדם</span>
+        <div className="flex flex-wrap gap-2">
+          {peoplePresets.map((preset) => (
+            <button
+              key={preset.key}
+              type="button"
+              className={cx(
+                "rounded-2xl border px-4 py-2 text-sm font-black transition",
+                selectedPreset === preset.key
+                  ? "border-yellow-500 bg-yellow-400 text-yellow-950"
+                  : "border-slate-200 bg-white text-slate-800 hover:bg-yellow-100",
+              )}
+              onClick={() => setSelectedPreset(preset.key)}
+            >
+              {preset.emoji} {preset.hint}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_auto_auto] lg:items-end">
+        <label>
+          <span className="mb-2 block text-sm font-black text-slate-700">שם האדם</span>
+          <input
+            className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-lg font-black"
+            value={newPersonName}
+            onChange={(event) => setNewPersonName(event.target.value)}
+            placeholder="למשל: יוני, שירה, דני"
+          />
+        </label>
+        <div>
+          <span className="mb-2 block text-sm font-black text-slate-700">תמונה (אופציונלי)</span>
+          <div className="flex items-center gap-2">
+            {newPersonImage ? (
+              <img
+                src={newPersonImage}
+                alt="תצוגה מקדימה"
+                className="h-14 w-14 rounded-full object-cover ring-2 ring-yellow-300"
+              />
+            ) : (
+              <span className="grid h-14 w-14 place-items-center rounded-full bg-yellow-100 text-2xl">
+                {selectedEmoji}
+              </span>
+            )}
+            <label className="cursor-pointer rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-black">
+              בחר תמונה
+              <input
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (!file) return;
+                  if (!file.type.startsWith("image/")) {
+                    onPhotoError("בחר/י קובץ תמונה בלבד.");
+                    return;
+                  }
+                  if (file.size > MAX_FAMILY_PHOTO_BYTES) {
+                    onPhotoError("התמונה גדולה מדי. עד 8MB.");
+                    return;
+                  }
+                  void prepareFamilyPhoto(file)
+                    .then((dataUrl) => {
+                      setNewPersonImage(dataUrl);
+                      onPhotoError("");
+                    })
+                    .catch(() => onPhotoError("לא הצלחנו לטעון את התמונה."));
+                }}
+              />
+            </label>
+            {newPersonImage && (
+              <button
+                type="button"
+                className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm font-black"
+                onClick={() => setNewPersonImage(undefined)}
+              >
+                הסר
+              </button>
+            )}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="rounded-2xl bg-yellow-500 px-5 py-3 font-black text-yellow-950"
+          onClick={addPerson}
+        >
+          הוספת אדם
+        </button>
+      </div>
+
+      {photoError && (
+        <p className="mt-3 rounded-2xl bg-red-100 px-4 py-2 text-sm font-black text-red-800">
+          {photoError}
+        </p>
+      )}
+
+      <div className="mt-6 space-y-3">
+        <h3 className="text-lg font-black">כל האנשים בלוח</h3>
+        {peopleSymbols.length === 0 ? (
+          <p className="text-muted">עדיין לא נוספו אנשים.</p>
+        ) : (
+          <div className="max-h-[min(32rem,60vh)] space-y-3 overflow-y-auto overscroll-contain pr-1">
+          {peopleSymbols.map((symbol) => {
+            const isCustom = symbol.id.startsWith("custom-");
+            const draftName = getDraftName(symbol);
+
+            return (
+              <div
+                key={symbol.id}
+                className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+              >
+                <div className="flex flex-wrap items-end gap-3">
+                  {symbol.pictogramId ? (
+                    <img
+                      src={arasaacImageUrl(symbol.pictogramId)}
+                      alt={symbol.label}
+                      className="h-9 w-9 rounded-md object-cover"
+                    />
+                  ) : (
+                    <span className="text-3xl">{symbol.emoji}</span>
+                  )}
+                  <label className="min-w-48 flex-1">
+                    <span className="mb-1 block text-xs font-black text-slate-600">שם במסך הילד</span>
+                    <input
+                      className="w-full rounded-xl border border-slate-200 px-3 py-2 font-black"
+                      value={draftName}
+                      onChange={(event) =>
+                        setNameDrafts((current) => ({
+                          ...current,
+                          [symbol.id]: event.target.value,
+                        }))
+                      }
+                      onBlur={() => savePersonName(symbol, draftName)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="rounded-xl bg-violet-600 px-4 py-2 text-sm font-black text-white"
+                    onClick={() => savePersonName(symbol, draftName)}
+                  >
+                    שמירת שם
+                  </button>
+                  {isCustom && (
+                    <button
+                      type="button"
+                      className="rounded-xl bg-red-100 px-4 py-2 text-sm font-black text-red-700"
+                      onClick={() => deletePerson(symbol.id)}
+                    >
+                      מחיקה
+                    </button>
+                  )}
+                </div>
+                <div className="mt-3">
+                  <SymbolPhotoUpload
+                    symbol={symbol}
+                    imageUrl={resolveSymbolImage(symbol, state.symbolImages)}
+                    onUpload={(file) => onUploadPhoto(symbol.id, file)}
+                    onRemove={() => onRemovePhoto(symbol.id)}
+                    compact
+                  />
+                </div>
+              </div>
+            );
+          })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SymbolPhotoUpload({
+  symbol,
+  imageUrl,
+  onUpload,
+  onRemove,
+  compact = false,
+}: {
+  symbol: AacSymbol;
+  imageUrl?: string;
+  onUpload: (file: File) => Promise<void>;
+  onRemove: () => void;
+  compact?: boolean;
+}) {
+  const inputId = `photo-${symbol.id}`;
+
+  return (
+    <div
+      className={cx(
+        "flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3",
+        compact && "flex-wrap",
+      )}
+    >
+      {imageUrl || symbol.pictogramId ? (
+        <img
+          src={imageUrl || arasaacImageUrl(symbol.pictogramId as number)}
+          alt={symbol.label}
+          className={cx(
+            "h-14 w-14 shrink-0 object-cover",
+            imageUrl ? "rounded-full ring-2 ring-yellow-300" : "rounded-xl bg-yellow-50",
+          )}
+        />
+      ) : (
+        <span className="grid h-14 w-14 shrink-0 place-items-center rounded-full bg-yellow-100 text-2xl">
+          {symbol.emoji}
+        </span>
+      )}
+      <div className="min-w-0 flex-1">
+        <div className="font-black">{symbol.label}</div>
+        <div className="text-sm text-muted">{imageUrl ? "יש תמונה" : "אין תמונה"}</div>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <label
+          htmlFor={inputId}
+          className="cursor-pointer rounded-2xl bg-yellow-400 px-4 py-2 text-sm font-black text-yellow-950"
+        >
+          {imageUrl ? "שנה" : "הוסף תמונה"}
+        </label>
+        <input
+          id={inputId}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (file) {
+              void onUpload(file);
+            }
+          }}
+        />
+        {imageUrl && (
+          <button
+            type="button"
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-black"
+            onClick={onRemove}
+          >
+            הסר
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SymbolsDashboard({
+  state,
+  allSymbols,
+  allCategories,
+  update,
+}: {
+  state: DemoState;
+  allSymbols: AacSymbol[];
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  update: (updater: (current: DemoState) => DemoState) => void;
+}) {
+  const [newSymbolLabel, setNewSymbolLabel] = useState("");
+  const [newSymbolEmoji, setNewSymbolEmoji] = useState("⭐");
+  const [newSymbolCategoryId, setNewSymbolCategoryId] = useState(allCategories[0]?.id ?? "feelings");
+  const [newSymbolImage, setNewSymbolImage] = useState<string | undefined>(undefined);
+  const [newCategoryLabel, setNewCategoryLabel] = useState("");
+  const [newCategoryEmoji, setNewCategoryEmoji] = useState("📁");
+  const [openCategoryIds, setOpenCategoryIds] = useState<string[]>([]);
+  const [familyPhotoError, setFamilyPhotoError] = useState("");
+  const [formError, setFormError] = useState("");
+
+  const peopleSymbols = allSymbols.filter((symbol) => symbol.categoryId === "people");
+
+  const setSymbolImage = (symbolId: string, imageUrl: string | undefined): void => {
+    update((current) => {
+      const nextImages = { ...current.symbolImages };
+      if (imageUrl) {
+        nextImages[symbolId] = imageUrl;
+      } else {
+        delete nextImages[symbolId];
+      }
+      return { ...current, symbolImages: nextImages };
+    });
+  };
+
+  const handleSymbolImageUpload = async (symbolId: string, file: File): Promise<void> => {
+    if (!file.type.startsWith("image/")) {
+      setFamilyPhotoError("בחר/י קובץ תמונה בלבד.");
+      return;
+    }
+    if (file.size > MAX_FAMILY_PHOTO_BYTES) {
+      setFamilyPhotoError("התמונה גדולה מדי. עד 8MB.");
+      return;
+    }
+
+    try {
+      const dataUrl = await prepareFamilyPhoto(file);
+      setSymbolImage(symbolId, dataUrl);
+      setFamilyPhotoError("");
+    } catch {
+      setFamilyPhotoError("לא הצלחנו לטעון את התמונה.");
+    }
+  };
+
+  const toggleCategoryOpen = (categoryId: string): void => {
+    setOpenCategoryIds((current) =>
+      current.includes(categoryId)
+        ? current.filter((id) => id !== categoryId)
+        : [...current, categoryId],
+    );
+  };
+
+  const toggleListValue = (
+    listName: "hiddenSymbolIds" | "favoriteSymbolIds" | "coreSymbolIds" | "enabledCategoryIds",
+    value: string,
+  ): void => {
+    update((current) => ({
+      ...current,
+      [listName]: current[listName].includes(value)
+        ? current[listName].filter((id) => id !== value)
+        : [...current[listName], value],
+    }));
+  };
+
+  return (
+    <section>
+      <h1 className="text-3xl font-black">ניהול סמלים</h1>
+      <p className="mb-6 text-muted">
+        אפשר להוסיף קטגוריות וסמלים אישיים, להסתיר סמלים, לסמן מועדפים ולבחור סמלי ליבה.
+      </p>
+
+      <PeopleManager
+        state={state}
+        peopleSymbols={peopleSymbols}
+        update={update}
+        onUploadPhoto={handleSymbolImageUpload}
+        onRemovePhoto={(symbolId) => setSymbolImage(symbolId, undefined)}
+        photoError={familyPhotoError}
+        onPhotoError={setFamilyPhotoError}
+      />
+
+      <div className="mb-8 rounded-soft border border-emerald-100 bg-emerald-50/70 p-5 shadow-sm">
+        <h2 className="text-xl font-black">הוספת קטגוריה חדשה</h2>
+        <p className="mt-1 text-muted">צרו קטגוריה משלכם ואז הוסיפו אליה סמלים.</p>
+        <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_minmax(280px,360px)_auto] lg:items-end">
+          <input
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-3"
+            value={newCategoryLabel}
+            onChange={(event) => setNewCategoryLabel(event.target.value)}
+            placeholder="שם הקטגוריה, למשל: חיות"
+          />
+          <EmojiPickerField
+            label="אימוג׳י לקטגוריה"
+            value={newCategoryEmoji}
+            onChange={setNewCategoryEmoji}
+          />
+          <button
+            type="button"
+            className="rounded-2xl bg-emerald-500 px-5 py-3 font-black text-white"
+            onClick={() => {
+              const label = newCategoryLabel.trim();
+              const emoji = newCategoryEmoji.trim() || "📁";
+              if (!label) {
+                setFormError("הזינ/י שם לקטגוריה.");
+                return;
+              }
+
+              const categoryId = `custom-cat-${Date.now()}`;
+              update((current) => ({
+                ...current,
+                customCategories: [...current.customCategories, { id: categoryId, label, emoji }],
+                enabledCategoryIds: [...current.enabledCategoryIds, categoryId],
+              }));
+              setOpenCategoryIds((current) => [...current, categoryId]);
+              setNewSymbolCategoryId(categoryId);
+              setNewCategoryLabel("");
+              setNewCategoryEmoji("📁");
+              setFormError("");
+            }}
+          >
+            הוספת קטגוריה
+          </button>
+        </div>
+      </div>
+
+      <div className="mb-8 rounded-soft border border-blue-100 bg-blue-50/70 p-5 shadow-sm">
+        <h2 className="text-xl font-black">הוספת סמל חדש</h2>
+        <p className="mt-1 text-muted">הוסיפו מילה אישית עם אימוג׳י — היא תופיע גם במסך הילד.</p>
+        <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_minmax(280px,360px)_220px_auto] lg:items-end">
+          <input
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-3"
+            value={newSymbolLabel}
+            onChange={(event) => setNewSymbolLabel(event.target.value)}
+            placeholder="שם הסמל, למשל: סבתא"
+          />
+          <EmojiPickerField
+            label="אימוג׳י לסמל"
+            value={newSymbolEmoji}
+            onChange={setNewSymbolEmoji}
+          />
+          <div>
+            <label className="mb-2 block text-sm font-black text-slate-700">קטגוריה</label>
+            <select
+              className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3"
+              value={newSymbolCategoryId}
+              onChange={(event) => {
+                setNewSymbolCategoryId(event.target.value);
+                if (event.target.value !== "people") {
+                  setNewSymbolImage(undefined);
+                }
+              }}
+            >
+              {allCategories.map((category) => (
+                <option key={category.id} value={category.id}>
+                  {category.emoji} {category.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          {newSymbolCategoryId === "people" && (
+            <div className="lg:col-span-2">
+              <label className="mb-2 block text-sm font-black text-slate-700">
+                תמונה של בן/בת משפחה (אופציונלי)
+              </label>
+              <div className="flex flex-wrap items-center gap-3">
+                {newSymbolImage ? (
+                  <img
+                    src={newSymbolImage}
+                    alt="תצוגה מקדימה"
+                    className="h-16 w-16 rounded-full object-cover ring-2 ring-yellow-300"
+                  />
+                ) : (
+                  <span className="grid h-16 w-16 place-items-center rounded-full bg-yellow-100 text-2xl">
+                    👤
+                  </span>
+                )}
+                <label className="cursor-pointer rounded-2xl bg-yellow-400 px-4 py-3 font-black text-yellow-950">
+                  {newSymbolImage ? "שנה תמונה" : "בחר תמונה"}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = "";
+                      if (!file) return;
+                      if (!file.type.startsWith("image/")) {
+                        setFamilyPhotoError("בחר/י קובץ תמונה בלבד.");
+                        return;
+                      }
+                      if (file.size > MAX_FAMILY_PHOTO_BYTES) {
+                        setFamilyPhotoError("התמונה גדולה מדי. עד 8MB.");
+                        return;
+                      }
+                      void prepareFamilyPhoto(file)
+                        .then((dataUrl) => {
+                          setNewSymbolImage(dataUrl);
+                          setFamilyPhotoError("");
+                        })
+                        .catch(() => {
+                          setFamilyPhotoError("לא הצלחנו לטעון את התמונה.");
+                        });
+                    }}
+                  />
+                </label>
+                {newSymbolImage && (
+                  <button
+                    type="button"
+                    className="rounded-2xl border border-slate-200 bg-white px-4 py-3 font-black"
+                    onClick={() => setNewSymbolImage(undefined)}
+                  >
+                    הסר
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+          <button
+            type="button"
+            className="rounded-2xl bg-blue-500 px-5 py-3 font-black text-white"
+            onClick={() => {
+              const label = newSymbolLabel.trim();
+              const emoji = newSymbolEmoji.trim() || (newSymbolCategoryId === "people" ? "👤" : "⭐");
+              if (!label) {
+                setFormError("הזינ/י שם לסמל.");
+                return;
+              }
+
+              const symbolId = `custom-${Date.now()}`;
+              const customSymbol: AacSymbol = {
+                id: symbolId,
+                label,
+                emoji,
+                categoryId: newSymbolCategoryId,
+              };
+
+              update((current) => ({
+                ...current,
+                customSymbols: [...current.customSymbols, customSymbol],
+                favoriteSymbolIds: [...current.favoriteSymbolIds, customSymbol.id],
+                symbolImages: newSymbolImage
+                  ? { ...current.symbolImages, [symbolId]: newSymbolImage }
+                  : current.symbolImages,
+              }));
+              setOpenCategoryIds((current) =>
+                current.includes(newSymbolCategoryId)
+                  ? current
+                  : [...current, newSymbolCategoryId],
+              );
+              setNewSymbolLabel("");
+              setNewSymbolEmoji("⭐");
+              setNewSymbolImage(undefined);
+              setFormError("");
+            }}
+          >
+            הוספת סמל
+          </button>
+        </div>
+        {formError && (
+          <p className="mt-3 rounded-2xl bg-red-100 px-4 py-2 text-sm font-black text-red-800">
+            {formError}
+          </p>
+        )}
+      </div>
+
+      <h2 className="mb-3 text-xl font-black">קטגוריות פעילות</h2>
+      <div className="mb-8 flex flex-wrap gap-3">
+        {allCategories.map((category) => {
+          const isEnabled = state.enabledCategoryIds.includes(category.id);
+
+          return (
+          <button
+            key={category.id}
+            type="button"
+            className={cx(
+              "rounded-full border px-4 py-2 font-black",
+              isEnabled
+                ? "border-blue-500 bg-blue-500 text-white"
+                : "border-slate-200 bg-white text-slate-950",
+            )}
+            onClick={() => toggleListValue("enabledCategoryIds", category.id)}
+          >
+            {category.emoji} {category.label}
+          </button>
+          );
+        })}
+      </div>
+
+      <div className="space-y-4">
+        {allCategories.map((category) => {
+          const isOpen = openCategoryIds.includes(category.id);
+          const symbolCount = allSymbols.filter((symbol) => symbol.categoryId === category.id).length;
+
+          return (
+          <section key={category.id} className="rounded-soft border border-slate-200 bg-white shadow-sm">
+            <button
+              type="button"
+              className="flex w-full items-center justify-between gap-4 p-5 text-right"
+              onClick={() => toggleCategoryOpen(category.id)}
+            >
+              <span className="text-sm font-black text-slate-500">{isOpen ? "סגור" : "פתח"}</span>
+              <span className="flex flex-1 items-center justify-end gap-3">
+                <span className="text-sm text-muted">{symbolCount} סמלים</span>
+                <span className="text-xl font-black">
+                  {category.emoji} {category.label}
+                </span>
+              </span>
+            </button>
+            {isOpen && (
+            <div className="space-y-3 border-t border-slate-100 p-5 pt-4">
+              {allSymbols
+                .filter((symbol) => symbol.categoryId === category.id)
+                .map((symbol) => {
+                  const isHidden = state.hiddenSymbolIds.includes(symbol.id);
+                  const isFavorite = state.favoriteSymbolIds.includes(symbol.id);
+                  const isCore = state.coreSymbolIds.includes(symbol.id);
+
+                  return (
+                    <div
+                      key={symbol.id}
+                      className="flex flex-wrap items-center gap-4 rounded-2xl border border-slate-200 bg-slate-50 p-4"
+                    >
+                      {resolveSymbolImage(symbol, state.symbolImages) ? (
+                        <img
+                          src={resolveSymbolImage(symbol, state.symbolImages)}
+                          alt={symbol.label}
+                          className="h-12 w-12 rounded-full object-cover ring-2 ring-yellow-300"
+                        />
+                      ) : symbol.pictogramId ? (
+                        <img
+                          src={arasaacImageUrl(symbol.pictogramId)}
+                          alt={symbol.label}
+                          className="h-12 w-12 rounded-md object-cover"
+                        />
+                      ) : (
+                        <span className="text-3xl">{symbol.emoji}</span>
+                      )}
+                      <div className="min-w-40 flex-1">
+                        <div className="font-black">{symbol.label}</div>
+                        <div className="text-sm text-muted">
+                          {isHidden ? "מוסתר" : "מוצג"} · {isFavorite ? "מועדף" : "לא מועדף"} ·{" "}
+                          {isCore ? "סמל בית" : "רגיל"}
+                        </div>
+                      </div>
+                      {category.id === "people" && (
+                        <label className="cursor-pointer rounded-2xl bg-yellow-400 px-4 py-2 text-sm font-black text-yellow-950">
+                          {resolveSymbolImage(symbol, state.symbolImages) ? "שנה תמונה" : "הוסף תמונה"}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              event.target.value = "";
+                              if (file) {
+                                void handleSymbolImageUpload(symbol.id, file);
+                              }
+                            }}
+                          />
+                        </label>
+                      )}
+                      <button
+                        type="button"
+                        className="rounded-2xl border border-slate-200 bg-white px-4 py-2 font-black"
+                        onClick={() => toggleListValue("hiddenSymbolIds", symbol.id)}
+                      >
+                        {isHidden ? "הצג" : "הסתר"}
+                      </button>
+                      <button
+                        type="button"
+                        className={cx(
+                          "rounded-2xl border border-slate-200 bg-white px-4 py-2 font-black",
+                          isFavorite && "bg-amber-100",
+                        )}
+                        onClick={() => toggleListValue("favoriteSymbolIds", symbol.id)}
+                      >
+                        ★ מועדף
+                      </button>
+                      <button
+                        type="button"
+                        className={cx(
+                          "rounded-2xl border border-slate-200 bg-white px-4 py-2 font-black",
+                          isCore && "bg-emerald-100",
+                        )}
+                        onClick={() => toggleListValue("coreSymbolIds", symbol.id)}
+                      >
+                        סמל ליבה
+                      </button>
+                    </div>
+                  );
+                })}
+            </div>
+            )}
+          </section>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ProgressDashboard({
+  state,
+  activeTopic,
+  averageLength,
+  allSymbolById,
+  allCategories,
+}: {
+  state: DemoState;
+  activeTopic: { id: string; label: string; emoji: string } | undefined;
+  averageLength: string;
+  allSymbolById: Record<string, AacSymbol>;
+  allCategories: Array<{ id: string; label: string; emoji: string }>;
+}) {
+  const symbolUses = Object.values(state.usageBySymbolId).reduce((total, value) => total + value, 0);
+  const topCategories = Object.entries(state.categoryUsageById)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 4);
+  const topSymbols = Object.entries(state.usageBySymbolId)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5);
+  const activeTopicUsage = activeTopic?.id
+    ? (state.topicUsageById[activeTopic.id] ?? 0)
+    : 0;
+  const trend =
+    state.sentenceCount >= 5
+      ? "עלייה יפה בשימוש"
+      : state.sentenceCount > 0
+        ? "מתחילים לצבור שימוש"
+        : "עדיין אין נתוני שימוש";
+
+  return (
+    <section>
+      <h1 className="mb-6 text-3xl font-black">מעקב התקדמות</h1>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <Metric label="שימוש יומי" value={String(state.sentenceCount)} />
+        <Metric label="אורך משפט ממוצע" value={averageLength} />
+        <Metric label="שימושים בסמלים" value={String(symbolUses)} />
+        <Metric label="שימוש בנושא השבוע" value={String(activeTopicUsage)} />
+      </div>
+
+      <div className="mt-6 grid gap-5 xl:grid-cols-2">
+        <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="mb-4 text-xl font-black">קטגוריות הכי בשימוש</h2>
+          {topCategories.length === 0 ? (
+            <p className="text-muted">עדיין אין מספיק נתונים. נסו לבנות כמה משפטים במסך הילד.</p>
+          ) : (
+            <div className="space-y-3">
+              {topCategories.map(([categoryId, count]) => {
+                const category = allCategories.find((item) => item.id === categoryId);
+                return (
+                  <div key={categoryId} className="flex items-center justify-between rounded-2xl bg-slate-50 p-4">
+                    <span className="font-black">
+                      {category?.emoji} {category?.label ?? categoryId}
+                    </span>
+                    <span className="text-muted">{count}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="mb-4 text-xl font-black">סמלים נפוצים</h2>
+          {topSymbols.length === 0 ? (
+            <p className="text-muted">הסמלים הנפוצים יופיעו כאן אחרי שימוש.</p>
+          ) : (
+            <div className="space-y-3">
+              {topSymbols.map(([symbolId, count]) => {
+                const symbol = allSymbolById[symbolId];
+                return (
+                  <div key={symbolId} className="flex items-center gap-3 rounded-2xl bg-slate-50 p-4">
+                    {symbol?.pictogramId ? (
+                      <img
+                        src={arasaacImageUrl(symbol.pictogramId)}
+                        alt={symbol.label}
+                        className="h-9 w-9 rounded-md object-cover"
+                      />
+                    ) : (
+                      <span className="text-2xl">{symbol?.emoji}</span>
+                    )}
+                    <span className="flex-1 font-black">{symbol?.label ?? symbolId}</span>
+                    <span className="text-muted">{count}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-5 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="text-sm font-black text-muted">מגמת שיפור</div>
+        <div className="mt-2 text-2xl font-black text-emerald-700">📈 {trend}</div>
+        <p className="mt-2 text-muted">
+          המגמה מבוססת על מספר משפטים ושימושים בסמלים, בלי אבחון רפואי.
+        </p>
+      </div>
+    </section>
+  );
+}

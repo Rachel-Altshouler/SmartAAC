@@ -1,0 +1,16 @@
+node_modules
+
+# secrets — set these in Vercel → Settings → Environment Variables instead
+.env.local
+.env*.local
+
+# Next.js build output
+.next/
+out/
+*.tsbuildinfo
+
+# editor / tool local state
+.vs/
+.vscode/
+.claude/
+.DS_Store

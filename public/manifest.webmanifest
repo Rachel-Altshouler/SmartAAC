@@ -1,0 +1,11 @@
+{
+  "name": "SmartAAC",
+  "short_name": "SmartAAC",
+  "description": "Rule-based AAC communication demo",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#edf3f8",
+  "theme_color": "#edf3f8",
+  "dir": "rtl",
+  "lang": "he"
+}
