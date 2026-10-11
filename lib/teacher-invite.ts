@@ -32,26 +32,32 @@ export type TeacherInviteContent = {
 
 
 
-const normalizeOrigin = (origin: string): string => {
+// The live site. Invite links always point here, so someone invited from a
+// computer running the app locally (localhost) still lands on the real site.
+const PUBLIC_SITE_URL = "https://smart-aac.vercel.app";
 
-  const trimmed = origin.trim();
+const isLocalHost = (hostname: string): boolean =>
+  hostname === "localhost" ||
+  hostname === "127.0.0.1" ||
+  hostname.startsWith("192.168.") ||
+  hostname.startsWith("10.");
 
-  if (!trimmed) {
-
-    return process.env.APP_BASE_URL?.trim() || "http://localhost:3000";
-
-  }
-
+const parseOrigin = (value: string | undefined): URL | null => {
   try {
-
-    return new URL(trimmed).origin;
-
+    return value?.trim() ? new URL(value.trim()) : null;
   } catch {
-
-    return process.env.APP_BASE_URL?.trim() || "http://localhost:3000";
-
+    return null;
   }
+};
 
+const normalizeOrigin = (origin: string): string => {
+  const fromRequest = parseOrigin(origin);
+  if (fromRequest && !isLocalHost(fromRequest.hostname)) return fromRequest.origin;
+
+  const configured = parseOrigin(process.env.APP_BASE_URL);
+  if (configured && !isLocalHost(configured.hostname)) return configured.origin;
+
+  return PUBLIC_SITE_URL;
 };
 
 

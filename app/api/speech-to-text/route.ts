@@ -51,9 +51,20 @@ async function transcribeWithOpenAi(audio: Blob): Promise<{ text?: string; error
   return { text };
 }
 
+// Phrases Whisper "hears" in silence or faint noise. Dropped only when the
+// recording was also quiet, so a child who clearly says "תודה" still gets it.
+const STOCK_HALLUCINATIONS = new Set(["תודה", "תודה רבה", "תודה לכם", "תודה רבה לכם", "תודה שצפיתם", "תודה רבה שצפיתם"]);
+const QUIET_PEAK = 0.08;
+
+const isQuietHallucination = (text: string, peak: number): boolean =>
+  peak < QUIET_PEAK && STOCK_HALLUCINATIONS.has(text.replace(/[.,!?״"'\s]+/g, " ").trim());
+
 export async function POST(request: Request) {
   const formData = await request.formData();
   const audio = formData.get("audio");
+  // Loudest sample of the recording (0–1), measured in the browser; absent = unknown.
+  const peakValue = Number(formData.get("peak"));
+  const peak = Number.isFinite(peakValue) && formData.get("peak") !== null ? peakValue : 1;
 
   if (!(audio instanceof Blob) || audio.size === 0) {
     return NextResponse.json({ error: "missing audio" }, { status: 400 });
@@ -68,12 +79,21 @@ export async function POST(request: Request) {
 
   if (getGroqApiKey()) {
     const groqResult = await groqTranscribeAudio(audio);
+    if (groqResult.ok && isQuietHallucination(groqResult.text, peak)) {
+      return NextResponse.json({ error: "empty transcript" }, { status: 422 });
+    }
     if (groqResult.ok) {
       return NextResponse.json({ text: groqResult.text, provider: "groq" });
+    }
+    if (groqResult.error === "empty transcript") {
+      return NextResponse.json({ error: "empty transcript" }, { status: 422 });
     }
   }
 
   const openAiResult = await transcribeWithOpenAi(audio);
+  if (openAiResult.text && isQuietHallucination(openAiResult.text, peak)) {
+    return NextResponse.json({ error: "empty transcript" }, { status: 422 });
+  }
   if (openAiResult.text) {
     return NextResponse.json({ text: openAiResult.text, provider: "openai" });
   }

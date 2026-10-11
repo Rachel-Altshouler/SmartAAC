@@ -50,6 +50,7 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   const userId = userResult.data.user.id;
 
+  // Anyone on the child's care team can invite (creator or joined member).
   let childQuery = client
     .from("children")
     .select("id, display_name, parent_id")
@@ -58,11 +59,14 @@ export async function POST(request: Request): Promise<NextResponse> {
     .limit(1);
 
   if (body.childId) {
-    childQuery = client
+    const access = await client.rpc("can_access_child", { child_uuid: body.childId });
+    if (access.error || access.data !== true) {
+      return NextResponse.json({ error: "אין הרשאה להזמין לילד הזה." }, { status: 403 });
+    }
+    childQuery = (createAdminSupabaseClient() ?? client)
       .from("children")
       .select("id, display_name, parent_id")
       .eq("id", body.childId)
-      .eq("parent_id", userId)
       .limit(1);
   }
 

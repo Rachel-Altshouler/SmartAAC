@@ -6,6 +6,8 @@ import {
   type CalendarEvent,
   type DemoState,
   type FunctionalityLevel,
+  type StoryResult,
+  type WeeklyTopic,
   arasaacImageUrl,
   getAllCategories,
   allEmojiChoices,
@@ -20,6 +22,19 @@ import {
 } from "@/lib/demo-data";
 import { getEventsThisWeek, getWeeklyTopicSentences } from "@/lib/context-engine";
 import { genderWord, localFixSentence } from "@/lib/hebrew-grammar";
+import {
+  emptyUsage,
+  getDeviceId,
+  pickUsage,
+  splitServerUsage,
+  withCombinedUsage,
+} from "@/lib/usage-stats";
+import {
+  FALLBACK_CORE_SYMBOLS,
+  FALLBACK_EVENT_SYMBOLS,
+  MAX_EVENT_SYMBOLS,
+  type EventSymbolsResult,
+} from "@/lib/event-symbols";
 import { SharedLibraryDashboard } from "@/components/shared-library";
 import { ChildDevicePanel, isChildDeviceEnabled, ParentPinModal } from "@/components/child-device";
 import { buildLocalChildAiAnswer } from "@/lib/local-ai";
@@ -78,7 +93,6 @@ const sentenceItemLabel = (
 
 type DashboardView =
   | "overview"
-  | "calendar"
   | "events"
   | "topic"
   | "level"
@@ -98,6 +112,17 @@ const readJsonResponse = async (response: Response): Promise<unknown> => {
     return JSON.parse(text);
   } catch {
     return { error: "השרת לא הגיב כמו שצריך (אולי הוא התעדכן באמצע). נסו שוב בעוד רגע." };
+  }
+};
+
+// The child this browser last worked on — sent on login so a returning user
+// lands on the same child.
+const readKnownChildId = (): string | undefined => {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    return raw ? (JSON.parse(raw) as { supabaseChildId?: string }).supabaseChildId : undefined;
+  } catch {
+    return undefined;
   }
 };
 
@@ -255,6 +280,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
       childName: draft.childName,
       childAccessCode: draft.childAccessCode,
       knownInviteCode: readKnownInviteCode(),
+      knownChildId: readKnownChildId(),
       functionalityLevel: draft.functionalityLevel,
     }),
   });
@@ -270,6 +296,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
     childName?: string;
     linkedChildren?: Array<{ id: string; name: string }>;
     session?: { access_token: string; refresh_token: string };
+    accountType?: AccountType;
   };
 
   if (!setupRes.ok || !payload.userId) {
@@ -294,7 +321,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
     childName: payload.childName,
     linkedChildren: payload.linkedChildren,
     mode: draft.mode,
-    accountType: draft.accountType,
+    accountType: payload.accountType ?? draft.accountType,
   };
 }
 
@@ -317,6 +344,7 @@ const applyRecoveredAuthToState = (
       ...current,
       dashboardRole: role,
       isProfileCreator: false,
+      teacherInviteCode: recovered.teacherInviteCode ?? "",
       connectedTeacherEmail: recovered.email,
       parentEmail: current.parentEmail || recovered.email,
       activeChildName: recovered.childName ?? current.activeChildName,
@@ -348,13 +376,29 @@ const applyRecoveredAuthToState = (
   }
 };
 
+const findWeeklyTopic = (customTopics: WeeklyTopic[] | undefined, topicId: string) =>
+  [...weeklyTopics, ...(customTopics ?? [])].find((topic) => topic.id === topicId);
+
+// Server-issued event ids are UUIDs; anything else is a local id that was
+// never saved (offline, or still on its way to the server).
+const isServerId = (id: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id);
+
+const EVENT_EMOJI_CHOICES = ["📌", "🩺", "🦷", "🏥", "🎭", "🎨", "🎵", "🏊", "⚽", "✈️", "🚗", "🕍", "🎉", "🛒", "💇", "🐶"];
+
 const eventLabels: Record<CalendarEvent["type"], { label: string; emoji: string }> = {
   trip: { label: "טיול", emoji: "🚌" },
   birthday: { label: "יום הולדת", emoji: "🎂" },
   school: { label: "פעילות בכיתה", emoji: "🏫" },
   family: { label: "מפגש משפחתי", emoji: "👪" },
   special: { label: "פעילות מיוחדת", emoji: "⭐" },
+  custom: { label: "סוג אחר", emoji: "📌" },
 };
+
+// An event's type label + emoji — its own ones for a custom type.
+const eventInfo = (event: CalendarEvent): { label: string; emoji: string } =>
+  event.type === "custom"
+    ? { label: event.customLabel || eventLabels.custom.label, emoji: event.customEmoji || eventLabels.custom.emoji }
+    : eventLabels[event.type];
 
 const levelLabels: Record<FunctionalityLevel, string> = {
   low: "נמוכה",
@@ -362,7 +406,12 @@ const levelLabels: Record<FunctionalityLevel, string> = {
   high: "גבוהה",
 };
 
-const today = (): string => new Date().toISOString().slice(0, 10);
+// Local calendar date (YYYY-MM-DD). toISOString() is UTC, which in Israel is
+// still "yesterday" between midnight and 2–3 AM.
+const localIsoDate = (date: Date): string =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+const today = (): string => localIsoDate(new Date());
 
 const cx = (...classes: Array<string | false | undefined>): string =>
   classes.filter(Boolean).join(" ");
@@ -439,6 +488,28 @@ const stripEmoji = (text: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
+// The voice chosen on this device ("בחירת קול"); voices differ per device,
+// so this is kept on the device and not synced.
+const VOICE_KEY = "smartaac-voice";
+
+const readChosenVoice = (): string => {
+  try {
+    return window.localStorage.getItem(VOICE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+};
+
+const hebrewVoicesOnDevice = (): SpeechSynthesisVoice[] =>
+  typeof window === "undefined" || !("speechSynthesis" in window)
+    ? []
+    : window.speechSynthesis
+        .getVoices()
+        .filter(
+          (voice) =>
+            voice.lang.startsWith("he") || voice.lang.startsWith("iw") || voice.name.toLowerCase().includes("hebrew"),
+        );
+
 const speakHebrew = (rawText: string, rate = 0.9, onEnd?: () => void): void => {
   const text = stripEmoji(rawText);
   if (!("speechSynthesis" in window) || !text) {
@@ -465,10 +536,21 @@ const speakHebrew = (rawText: string, rate = 0.9, onEnd?: () => void): void => {
         voice.lang.startsWith("iw") ||
         voice.name.toLowerCase().includes("hebrew"),
     );
-    // Prefer a voice installed on the device: remote/network voices (e.g. Chrome's
-    // default "Google עברית") commonly ignore the `rate` we set below.
+    // Clearest first: the natural (neural) voices — Microsoft "Hila"/"Avri" in
+    // Edge — then other installed voices, and Google's network voice last
+    // (it ignores the `rate` we set below). The old robotic "Asaf" is a last resort.
+    const score = (voice: SpeechSynthesisVoice): number => {
+      const name = voice.name.toLowerCase();
+      if (name.includes("natural")) return 0;
+      if (name.includes("online")) return 1;
+      if (name.includes("google")) return 3;
+      if (name.includes("asaf")) return 4;
+      return 2;
+    };
+    const chosen = readChosenVoice();
     const hebrewVoice =
-      hebrewVoices.find((voice) => voice.localService) ?? hebrewVoices[0];
+      hebrewVoices.find((voice) => voice.name === chosen) ??
+      [...hebrewVoices].sort((left, right) => score(left) - score(right))[0];
     if (hebrewVoice) {
       utterance.voice = hebrewVoice;
     }
@@ -538,7 +620,7 @@ const speechApiErrorMessage = (error?: string, detail?: string): string => {
     return "חסר מודל דיבור ב-Ollama. הריצ/י: ollama pull gemma4:e4b";
   }
   if (error === "empty transcript") {
-    return "לא שמעתי מילים. דבר/י קרוב למיקרופון ונס/י שוב.";
+    return "לא שמעתי מילים. דבר/י קרוב יותר למיקרופון ונס/י שוב.";
   }
   return "לא הצלחתי להבין את הדיבור. נס/י שוב, או כתב/י את המשפט.";
 };
@@ -664,7 +746,10 @@ const encodeWavBlob = (samples: Float32Array, sampleRate: number): Blob => {
   return new Blob([buffer], { type: "audio/wav" });
 };
 
-const recordingToWavBlob = async (blob: Blob): Promise<Blob> => {
+// Peak level (0–1) under which a recording is treated as silence.
+const SILENCE_PEAK = 0.02;
+
+const recordingToWavBlob = async (blob: Blob): Promise<{ wav: Blob; peak: number }> => {
   const audioContext = new AudioContext();
   try {
     const arrayBuffer = await blob.arrayBuffer();
@@ -678,9 +763,12 @@ const recordingToWavBlob = async (blob: Blob): Promise<Blob> => {
       }
     }
 
+    let peak = 0;
+    for (let i = 0; i < mono.length; i++) peak = Math.max(peak, Math.abs(mono[i]));
+
     const resampled = resampleMono(mono, audioBuffer.sampleRate, SPEECH_SAMPLE_RATE);
     const normalized = normalizeAudio(resampled);
-    return encodeWavBlob(normalized, SPEECH_SAMPLE_RATE);
+    return { wav: encodeWavBlob(normalized, SPEECH_SAMPLE_RATE), peak };
   } finally {
     await audioContext.close();
   }
@@ -867,7 +955,7 @@ const translateAuthError = (message: string): string => {
     return "הסיסמה שגויה, או שהאימייל לא מאושר. ב-Supabase: Users → בחר/י משתמש → Send password recovery.";
   }
   if (lower.includes("user already registered") || lower.includes("already been registered")) {
-    return "האימייל כבר רשום. התחברו עם אותו אימייל וסיסמה.";
+    return "הסיסמה לא תואמת לאימייל הזה. אפשר ללחוץ על \"שכחתי סיסמה\" ולקבל מייל לבחירת סיסמה חדשה.";
   }
   if (lower.includes("email not confirmed")) {
     return "האימייל לא מאושר. הוסיפ/י SUPABASE_SERVICE_ROLE_KEY ל-.env.local, או כבו Confirm email ב-Supabase → Authentication → Email.";
@@ -906,39 +994,43 @@ const daysFromToday = (dateValue: string): number => {
   return Math.round((target.getTime() - current.getTime()) / 86_400_000);
 };
 
-const getEventPrompts = (event: CalendarEvent): string[] => {
+const EVENT_SYMBOLS_CACHE_KEY = "smartaac-event-symbols";
+
+const eventWhenLabel = (event: CalendarEvent): string => {
   const distance = daysFromToday(event.date);
-  const title = event.title;
+  if (distance === 0) return "היום";
+  if (distance === 1) return "מחר";
+  if (distance === -1) return "אתמול";
+  return distance > 0 ? `בעוד ${distance} ימים` : `לפני ${Math.abs(distance)} ימים`;
+};
 
-  if (distance > 0) {
-    if (event.type === "trip") {
-      return [`יש לי טיול: ${title}`, "אני רוצה לדעת לאן נוסעים", "אני צריך להכין תיק", "אני מתרגש מהטיול"];
-    }
-    if (event.type === "birthday") {
-      return [`יש יום הולדת: ${title}`, "אני רוצה לברך מזל טוב", "אני רוצה לשיר שיר", "אני רוצה עוגה"];
-    }
-    if (event.type === "school") {
-      return [`יש פעילות בכיתה: ${title}`, "מה נעשה בפעילות?", "מי יהיה איתי?", "אני צריך עזרה להתכונן"];
-    }
-    if (event.type === "family") {
-      return [`יש מפגש משפחתי: ${title}`, "מי מגיע לבקר?", "אני רוצה להגיד שלום", "אני רוצה לשבת ליד המשפחה"];
-    }
-    return [`יש אירוע מיוחד: ${title}`, "מה הולך לקרות?", "אני רוצה להתכונן", "אני רוצה שמישהו יסביר לי"];
+// Before / on / after the day get different words ("מתרגש" vs "נהניתי"),
+// so the cached AI answer is kept per phase.
+const eventSymbolsKey = (event: CalendarEvent): string => {
+  const distance = daysFromToday(event.date);
+  const phase = distance > 0 ? "before" : distance === 0 ? "today" : "after";
+  return `${event.id}|${event.title}|${event.customLabel ?? event.type}|${phase}`;
+};
+
+const readEventSymbolsCache = (): Record<string, EventSymbolsResult> => {
+  try {
+    return JSON.parse(window.localStorage.getItem(EVENT_SYMBOLS_CACHE_KEY) ?? "{}") as Record<
+      string,
+      EventSymbolsResult
+    >;
+  } catch {
+    return {};
   }
+};
 
-  if (distance === 0) {
-    if (event.type === "trip") return ["הטיול היום", "אני רוצה ללכת לטיול", "אני צריך עזרה", "אני רוצה לספר איך אני מרגיש"];
-    if (event.type === "birthday") return ["יום ההולדת היום", "מזל טוב", "אני רוצה להשתתף", "אני רוצה הפסקה"];
-    if (event.type === "school") return ["הפעילות היום", "אני רוצה להשתתף", "אני צריך הסבר", "אני רוצה לשאול שאלה"];
-    if (event.type === "family") return ["המפגש היום", "אני רוצה להגיד שלום", "אני רוצה לשחק", "אני צריך מקום שקט"];
-    return ["האירוע היום", "אני רוצה לדעת מה עושים", "אני צריך עזרה", "אני רוצה לספר"];
+const writeEventSymbolsCache = (cache: Record<string, EventSymbolsResult>): void => {
+  try {
+    // keep it small: only the 40 most recent events
+    const entries = Object.entries(cache).slice(-40);
+    window.localStorage.setItem(EVENT_SYMBOLS_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // storage full or blocked — the symbols are just fetched again
   }
-
-  if (event.type === "trip") return ["איך היה בטיול?", "נהניתי בטיול", "היה לי קשה בטיול", "אני רוצה לספר מה ראיתי"];
-  if (event.type === "birthday") return ["איך היה ביום ההולדת?", "היה לי כיף", "בירכתי מזל טוב", "אני רוצה לספר מה אכלתי"];
-  if (event.type === "school") return ["מה עשינו בכיתה?", "השתתפתי בפעילות", "היה לי קל", "היה לי קשה"];
-  if (event.type === "family") return ["איך היה עם המשפחה?", "היה לי נעים", "רציתי לשחק", "רציתי לנוח"];
-  return ["איך היה באירוע?", "זה היה מיוחד", "אני רוצה לספר", "אני רוצה לשאול שאלה"];
 };
 
 export function SmartAACDemo() {
@@ -991,10 +1083,13 @@ export function SmartAACDemo() {
   // just received.
   const syncedChildIdRef = useRef<string | null>(null);
   const initialSyncDoneRef = useRef(false);
-  const skipEventsSyncRef = useRef(false);
   const skipTopicSyncRef = useRef(false);
   const skipSymbolSettingsSyncRef = useRef(false);
-  const skipSymbolImagesSyncRef = useRef(false);
+  // The photos as the server last had them — the base for sending only what
+  // changed on this device (null until this child's data was loaded).
+  const syncedImagesRef = useRef<Record<string, string> | null>(null);
+  const latestStateRef = useRef<DemoState>(initialState);
+  latestStateRef.current = state;
   const skipUsageStatsSyncRef = useRef(false);
 
   useEffect(() => {
@@ -1141,25 +1236,52 @@ export function SmartAACDemo() {
     return session.data.session?.access_token ?? null;
   };
 
-  const postChildData = async (payload: Record<string, unknown>): Promise<void> => {
+  const postChildData = async (
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | null> => {
     if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
-      return;
+      return null;
     }
     const token = await getSupabaseAccessToken();
-    if (!token) return;
+    if (!token) return null;
     try {
       const response = await fetch("/api/child-data", {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ childId: state.supabaseChildId, ...payload }),
       });
+      const result = (await readJsonResponse(response)) as Record<string, unknown>;
       if (!response.ok) {
-        const { error } = (await response.json().catch(() => ({}))) as { error?: string };
-        console.warn("smartaac: Supabase sync rejected", response.status, error);
+        console.warn("smartaac: Supabase sync rejected", response.status, result.error);
+        return null;
       }
+      return result;
     } catch (error) {
       console.warn("smartaac: failed to sync to Supabase", error);
+      return null;
     }
+  };
+
+  const addEvent = (event: Omit<CalendarEvent, "id">): void => {
+    // "local-" prefix: never mistaken for a server UUID (see isServerId).
+    const localId = `local-${createLocalId("event")}`;
+    setState((current) => ({ ...current, events: [...current.events, { ...event, id: localId }] }));
+    void postChildData({ addEvent: event }).then((result) => {
+      const saved = result?.event as CalendarEvent | undefined;
+      if (!saved) return;
+      // Swap the local id for the server's (a refresh may already have it).
+      setState((current) => ({
+        ...current,
+        events: current.events.some((item) => item.id === saved.id)
+          ? current.events.filter((item) => item.id !== localId)
+          : current.events.map((item) => (item.id === localId ? saved : item)),
+      }));
+    });
+  };
+
+  const deleteEvent = (eventId: string): void => {
+    setState((current) => ({ ...current, events: current.events.filter((item) => item.id !== eventId) }));
+    if (isServerId(eventId)) void postChildData({ deleteEventId: eventId });
   };
 
   // One-time, per login/child: pull saved data down from Supabase (server wins,
@@ -1190,8 +1312,9 @@ export function SmartAACDemo() {
           weeklyTopicId?: string | null;
           symbolSettings?: Partial<DemoState>;
           symbolImages?: Record<string, string>;
-          usageStats?: Partial<DemoState>;
+          usageStats?: unknown;
           hasSyncedBefore?: boolean;
+          accessCode?: string | null;
         };
 
         if (!response.ok) {
@@ -1208,7 +1331,6 @@ export function SmartAACDemo() {
           const keepLocalImages =
             Object.keys(serverImages).length === 0 && Object.keys(state.symbolImages).length > 0;
 
-          skipEventsSyncRef.current = true;
           // weeklyTopicId is a string: if the server's value equals the local
           // one the sync effect never fires, and a lingering skip flag would
           // swallow the user's next real topic change.
@@ -1216,12 +1338,15 @@ export function SmartAACDemo() {
             payload.weeklyTopicId && payload.weeklyTopicId !== state.weeklyTopicId,
           );
           skipSymbolSettingsSyncRef.current = true;
-          skipSymbolImagesSyncRef.current = !keepLocalImages;
           skipUsageStatsSyncRef.current = true;
+          // local-only photos (keepLocalImages) differ from this base, so the
+          // photo sync uploads them
+          syncedImagesRef.current = serverImages;
 
           setState((current) => ({
             ...current,
-            events: payload.events ?? current.events,
+            teacherInviteCode: payload.accessCode || current.teacherInviteCode,
+            events: payload.events ?? [],
             weeklyTopicId: payload.weeklyTopicId || current.weeklyTopicId,
             hiddenSymbolIds: payload.symbolSettings?.hiddenSymbolIds ?? current.hiddenSymbolIds,
             favoriteSymbolIds: payload.symbolSettings?.favoriteSymbolIds ?? current.favoriteSymbolIds,
@@ -1234,23 +1359,33 @@ export function SmartAACDemo() {
               payload.symbolSettings?.symbolLabelOverrides ?? current.symbolLabelOverrides,
             childGender: payload.symbolSettings?.childGender ?? current.childGender,
             smartGrammar: payload.symbolSettings?.smartGrammar ?? current.smartGrammar,
+            customTopics: payload.symbolSettings?.customTopics ?? current.customTopics,
             symbolImages: keepLocalImages ? { ...current.symbolImages } : serverImages,
-            usageBySymbolId: payload.usageStats?.usageBySymbolId ?? current.usageBySymbolId,
-            categoryUsageById: payload.usageStats?.categoryUsageById ?? current.categoryUsageById,
-            topicUsageById: payload.usageStats?.topicUsageById ?? current.topicUsageById,
-            sentenceCount: payload.usageStats?.sentenceCount ?? current.sentenceCount,
-            sentenceLengths: payload.usageStats?.sentenceLengths ?? current.sentenceLengths,
+            ...(() => {
+              const usage = splitServerUsage(payload.usageStats, getDeviceId());
+              return { ...(usage.mine ?? emptyUsage()), otherUsage: usage.others };
+            })(),
+            level: payload.symbolSettings?.level ?? current.level,
+            speechRate: payload.symbolSettings?.speechRate ?? current.speechRate,
+            showHolidays: payload.symbolSettings?.showHolidays ?? current.showHolidays,
           }));
 
           initialSyncDoneRef.current = true;
         } else {
+          // Events are stored per child on the server already — adopt them
+          // instead of uploading whatever this device showed for another child.
+          setState((current) => ({
+            ...current,
+            events: payload.events ?? [],
+            teacherInviteCode: payload.accessCode || current.teacherInviteCode,
+          }));
           initialSyncDoneRef.current = true;
+          syncedImagesRef.current = { ...state.symbolImages };
           void postChildData({
-            events: state.events,
             weeklyTopic: {
               id: state.weeklyTopicId,
               label:
-                weeklyTopics.find((topic) => topic.id === state.weeklyTopicId)?.label ??
+                findWeeklyTopic(state.customTopics, state.weeklyTopicId)?.label ??
                 state.weeklyTopicId,
             },
             symbolSettings: {
@@ -1263,15 +1398,13 @@ export function SmartAACDemo() {
               symbolLabelOverrides: state.symbolLabelOverrides,
               childGender: state.childGender,
               smartGrammar: state.smartGrammar,
+              customTopics: state.customTopics,
+              level: state.level,
+              speechRate: state.speechRate,
             },
             symbolImages: state.symbolImages,
-            usageStats: {
-              usageBySymbolId: state.usageBySymbolId,
-              categoryUsageById: state.categoryUsageById,
-              topicUsageById: state.topicUsageById,
-              sentenceCount: state.sentenceCount,
-              sentenceLengths: state.sentenceLengths,
-            },
+            usageStats: pickUsage(state),
+            deviceId: getDeviceId(),
           });
         }
       } catch (error) {
@@ -1282,47 +1415,113 @@ export function SmartAACDemo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.isRegisteredInSupabase, state.supabaseChildId]);
 
-  // Debounced sync: calendar events. Full delete+reinsert on the server (see
-  // app/api/child-data/route.ts), so the server always returns freshly-issued
-  // ids — adopt them locally (via the skip ref) so local state converges on
-  // the server's ids instead of looping.
+  // Events are saved one by one (add / delete), so a parent and a teacher
+  // editing the same child at once never overwrite each other's changes.
+  // Whenever the app comes back into view, this child's events are re-read
+  // from the server so changes made on another device show up.
   useEffect(() => {
-    if (!initialSyncDoneRef.current) return;
-    if (skipEventsSyncRef.current) {
-      skipEventsSyncRef.current = false;
-      return;
-    }
     if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
       return;
     }
-
     const childId = state.supabaseChildId;
-    const events = state.events;
+    let lastRefresh = 0;
 
-    const timeout = window.setTimeout(() => {
+    const refresh = (): void => {
+      if (document.visibilityState !== "visible" || !initialSyncDoneRef.current) return;
+      if (Date.now() - lastRefresh < 5000) return;
+      lastRefresh = Date.now();
       void (async () => {
         const token = await getSupabaseAccessToken();
         if (!token) return;
         try {
-          const response = await fetch("/api/child-data", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ childId, events }),
+          const response = await fetch(`/api/child-data?childId=${childId}`, {
+            headers: { Authorization: `Bearer ${token}` },
           });
-          const payload = (await response.json()) as { events?: CalendarEvent[] };
-          if (response.ok && payload.events) {
-            skipEventsSyncRef.current = true;
-            setState((current) => ({ ...current, events: payload.events as CalendarEvent[] }));
+          const payload = (await readJsonResponse(response)) as {
+            events?: CalendarEvent[];
+            weeklyTopicId?: string | null;
+            symbolSettings?: Partial<DemoState>;
+            symbolImages?: Record<string, string>;
+            accessCode?: string | null;
+            usageStats?: unknown;
+          };
+          const local = latestStateRef.current;
+          if (!response.ok || !payload.events || local.supabaseChildId !== childId) return;
+
+          const updates: Partial<DemoState> = {
+            // keep events still on their way to the server
+            events: [...payload.events, ...local.events.filter((event) => !isServerId(event.id))],
+          };
+
+          // Photos: the server's, plus any change on this device not sent yet.
+          const serverImages = payload.symbolImages ?? {};
+          const synced = syncedImagesRef.current ?? {};
+          const images = { ...serverImages };
+          Object.entries(local.symbolImages).forEach(([symbolId, image]) => {
+            if (synced[symbolId] !== image) images[symbolId] = image;
+          });
+          Object.keys(synced).forEach((symbolId) => {
+            if (!(symbolId in local.symbolImages)) delete images[symbolId];
+          });
+          syncedImagesRef.current = serverImages;
+          if (JSON.stringify(images) !== JSON.stringify(local.symbolImages)) updates.symbolImages = images;
+
+          // Settings changed on the other device.
+          const settings = payload.symbolSettings ?? {};
+          const settingKeys = [
+            "hiddenSymbolIds",
+            "favoriteSymbolIds",
+            "coreSymbolIds",
+            "enabledCategoryIds",
+            "customSymbols",
+            "customCategories",
+            "symbolLabelOverrides",
+            "childGender",
+            "smartGrammar",
+            "customTopics",
+            "level",
+            "speechRate",
+            "showHolidays",
+          ] as const;
+          const changedSettings = settingKeys.filter(
+            (key) => settings[key] !== undefined && JSON.stringify(settings[key]) !== JSON.stringify(local[key]),
+          );
+          if (changedSettings.length > 0) {
+            skipSymbolSettingsSyncRef.current = true;
+            changedSettings.forEach((key) => {
+              (updates as Record<string, unknown>)[key] = settings[key];
+            });
           }
+
+          updates.otherUsage = splitServerUsage(payload.usageStats, getDeviceId()).others;
+
+          if (payload.accessCode && payload.accessCode !== local.teacherInviteCode) {
+            updates.teacherInviteCode = payload.accessCode;
+          }
+
+          if (payload.weeklyTopicId && payload.weeklyTopicId !== local.weeklyTopicId) {
+            skipTopicSyncRef.current = true;
+            updates.weeklyTopicId = payload.weeklyTopicId;
+          }
+
+          setState((current) => (current.supabaseChildId === childId ? { ...current, ...updates } : current));
         } catch (error) {
-          console.warn("smartaac: failed to sync events to Supabase", error);
+          console.warn("smartaac: failed to refresh events", error);
         }
       })();
-    }, 1500);
+    };
 
-    return () => window.clearTimeout(timeout);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    // both screens open side by side: pick up the other side's changes too
+    const interval = window.setInterval(refresh, 30000);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+      window.clearInterval(interval);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.events]);
+  }, [state.isRegisteredInSupabase, state.supabaseChildId]);
 
   // Debounced sync: weekly topic.
   useEffect(() => {
@@ -1336,7 +1535,7 @@ export function SmartAACDemo() {
     }
 
     const topicLabel =
-      weeklyTopics.find((topic) => topic.id === state.weeklyTopicId)?.label ?? state.weeklyTopicId;
+      findWeeklyTopic(state.customTopics, state.weeklyTopicId)?.label ?? state.weeklyTopicId;
 
     const timeout = window.setTimeout(() => {
       void postChildData({ weeklyTopic: { id: state.weeklyTopicId, label: topicLabel } });
@@ -1372,6 +1571,10 @@ export function SmartAACDemo() {
           symbolLabelOverrides: state.symbolLabelOverrides,
           childGender: state.childGender,
           smartGrammar: state.smartGrammar,
+          customTopics: state.customTopics,
+          level: state.level,
+          speechRate: state.speechRate,
+          showHolidays: state.showHolidays,
         },
       });
     }, 1500);
@@ -1388,23 +1591,34 @@ export function SmartAACDemo() {
     state.symbolLabelOverrides,
     state.childGender,
     state.smartGrammar,
+    state.customTopics,
+    state.level,
+    state.speechRate,
+    state.showHolidays,
   ]);
 
   // Debounced sync: family photos — isolated from the settings bundle above
   // since photo payloads are large (same reason they're a separate
   // localStorage slot) and shouldn't re-upload on every favorite/hide toggle.
   useEffect(() => {
-    if (!initialSyncDoneRef.current) return;
-    if (skipSymbolImagesSyncRef.current) {
-      skipSymbolImagesSyncRef.current = false;
-      return;
-    }
+    if (!initialSyncDoneRef.current || syncedImagesRef.current === null) return;
     if (!supabase || !isSupabaseConfigured || !state.isRegisteredInSupabase || !state.supabaseChildId) {
       return;
     }
 
     const timeout = window.setTimeout(() => {
-      void postChildData({ symbolImages: state.symbolImages });
+      const synced = syncedImagesRef.current ?? {};
+      const set = Object.fromEntries(
+        Object.entries(state.symbolImages).filter(([symbolId, image]) => synced[symbolId] !== image),
+      );
+      const remove = Object.keys(synced).filter((symbolId) => !(symbolId in state.symbolImages));
+      if (Object.keys(set).length === 0 && remove.length === 0) return;
+      void postChildData({ symbolImagesPatch: { set, remove } }).then((result) => {
+        if (!result) return;
+        const next = { ...(syncedImagesRef.current ?? {}), ...set };
+        remove.forEach((symbolId) => delete next[symbolId]);
+        syncedImagesRef.current = next;
+      });
     }, 2000);
 
     return () => window.clearTimeout(timeout);
@@ -1424,15 +1638,7 @@ export function SmartAACDemo() {
     }
 
     const timeout = window.setTimeout(() => {
-      void postChildData({
-        usageStats: {
-          usageBySymbolId: state.usageBySymbolId,
-          categoryUsageById: state.categoryUsageById,
-          topicUsageById: state.topicUsageById,
-          sentenceCount: state.sentenceCount,
-          sentenceLengths: state.sentenceLengths,
-        },
-      });
+      void postChildData({ usageStats: pickUsage(state), deviceId: getDeviceId() });
     }, 10000);
 
     return () => window.clearTimeout(timeout);
@@ -1443,6 +1649,7 @@ export function SmartAACDemo() {
     state.topicUsageById,
     state.sentenceCount,
     state.sentenceLengths,
+    state.storyResults,
   ]);
 
   const continueSavedSession = (): void => {
@@ -1463,8 +1670,53 @@ export function SmartAACDemo() {
     );
   };
 
-  const activeTopic = weeklyTopics.find((topic) => topic.id === state.weeklyTopicId);
-  const eventsThisWeek = useMemo(() => getEventsThisWeek(state), [state]);
+  const activeTopic = findWeeklyTopic(state.customTopics, state.weeklyTopicId);
+  // Israeli holidays and national days, refreshed once a day (see /api/holidays).
+  const [holidays, setHolidays] = useState<Array<{ date: string; title: string; emoji: string }>>([]);
+  useEffect(() => {
+    const key = "smartaac-holidays-v2"; // bump when the list format changes
+    try {
+      const cached = JSON.parse(window.localStorage.getItem(key) ?? "null") as {
+        day?: string;
+        holidays?: Array<{ date: string; title: string; emoji: string }>;
+      } | null;
+      if (cached?.holidays) setHolidays(cached.holidays);
+      if (cached?.day === today()) return;
+    } catch {
+      // no cache — fetch below
+    }
+    void fetch("/api/holidays")
+      .then((response) => readJsonResponse(response))
+      .then((payload) => {
+        const list = (payload as { holidays?: Array<{ date: string; title: string; emoji: string }> }).holidays;
+        if (!list?.length) return;
+        setHolidays(list);
+        try {
+          window.localStorage.setItem(key, JSON.stringify({ day: today(), holidays: list }));
+        } catch {
+          // storage full — fetched again next time
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+  const holidayEvents: CalendarEvent[] = useMemo(
+    () =>
+      state.showHolidays === false
+        ? []
+        : holidays.map((holiday) => ({
+            id: `holiday-${holiday.date}-${holiday.title}`,
+            type: "custom",
+            title: holiday.title,
+            date: holiday.date,
+            customLabel: "חג / מועד",
+            customEmoji: holiday.emoji,
+          })),
+    [holidays, state.showHolidays],
+  );
+  const eventsThisWeek = useMemo(
+    () => getEventsThisWeek({ ...state, events: [...state.events, ...holidayEvents] }),
+    [state, holidayEvents],
+  );
   const allSymbols = useMemo(
     () =>
       [...symbols, ...state.customSymbols].map((symbol) => ({
@@ -1551,22 +1803,58 @@ export function SmartAACDemo() {
     if (!symbol) return;
 
     setSentence((current) => [...current, symbolId]);
-    updateState((current) => ({
-      ...current,
-      usageBySymbolId: {
-        ...current.usageBySymbolId,
-        [symbolId]: (current.usageBySymbolId[symbolId] ?? 0) + 1,
-      },
-    }));
+    updateState((current) => {
+      // Counts toward the weekly topic only when the symbol belongs to it.
+      const topic = findWeeklyTopic(current.customTopics, current.weeklyTopicId);
+      const inTopic = Boolean(topic?.symbolIds.includes(symbolId));
+      return {
+        ...current,
+        usageBySymbolId: {
+          ...current.usageBySymbolId,
+          [symbolId]: (current.usageBySymbolId[symbolId] ?? 0) + 1,
+        },
+        topicUsageById: inTopic
+          ? {
+              ...current.topicUsageById,
+              [current.weeklyTopicId]: (current.topicUsageById[current.weeklyTopicId] ?? 0) + 1,
+            }
+          : current.topicUsageById,
+      };
+    });
     speakText(genderWord(symbol.label, childGender));
   };
 
+  // A typed word that is on the board becomes that symbol (with its picture);
+  // any other word gets a picture looked up on ARASAAC.
   const addTypedText = (text: string): boolean => {
     const trimmed = sanitizeTypedText(text);
     if (!trimmed) return false;
 
-    setSentence((current) => [...current, encodeTypedToken(trimmed)]);
+    const byLabel = new Map(allSymbols.map((symbol) => [symbol.label, symbol.id]));
+    const tokens = trimmed.split(" ").filter(Boolean).map((word) => {
+      const bare = word.replace(/[?!.,]+$/, "");
+      const withoutPrefix = bare.length > 2 && "ובהלמשכ".includes(bare.charAt(0)) ? bare.slice(1) : "";
+      return byLabel.get(bare) ?? (withoutPrefix ? byLabel.get(withoutPrefix) : undefined) ?? encodeTypedToken(word);
+    });
+    setSentence((current) => [...current, ...tokens]);
     speakText(trimmed);
+
+    tokens.filter(isTypedToken).forEach((token) => {
+      const word = typedTokenLabel(token).replace(/[?!.,]+$/, "");
+      if (state.typedPictograms?.[word] !== undefined) return;
+      void fetch(`https://api.arasaac.org/v1/pictograms/he/search/${encodeURIComponent(word)}`, {
+        signal: AbortSignal.timeout(8000),
+      })
+        .then((response) => (response.ok ? response.json() : []))
+        .then((results: Array<{ _id?: number }>) => {
+          const id = Array.isArray(results) && typeof results[0]?._id === "number" ? results[0]._id : 0;
+          updateState((current) => ({
+            ...current,
+            typedPictograms: { ...(current.typedPictograms ?? {}), [word]: id },
+          }));
+        })
+        .catch(() => undefined);
+    });
     return true;
   };
 
@@ -1575,20 +1863,12 @@ export function SmartAACDemo() {
 
     const words = sentenceWords(symbolIds);
     const key = words.join(" ");
-    let text = localFixSentence(words, childGender);
-    if (smartGrammarOn && words.length > 1) {
-      if (fixedSentence?.key === key) {
-        text = fixedSentence.text;
-      } else {
-        setIsFixingSentence(true);
-        const fixed = await requestFixedSentence(words);
-        setIsFixingSentence(false);
-        if (fixed) {
-          text = fixed;
-          setFixedSentence({ key, text: fixed });
-        }
-      }
-    }
+    // Never make the child wait for the AI: speak the corrected sentence if
+    // it's already here, otherwise the locally gendered words right away.
+    const text =
+      smartGrammarOn && words.length > 1 && fixedSentence?.key === key
+        ? fixedSentence.text
+        : localFixSentence(words, childGender);
 
     speakText(text);
     updateState((current) => ({
@@ -1607,10 +1887,6 @@ export function SmartAACDemo() {
         },
         { ...current.categoryUsageById },
       ),
-      topicUsageById: {
-        ...current.topicUsageById,
-        [current.weeklyTopicId]: (current.topicUsageById[current.weeklyTopicId] ?? 0) + 1,
-      },
     }));
   };
 
@@ -1684,6 +1960,8 @@ export function SmartAACDemo() {
         ...current,
         dashboardRole: input.role,
         isProfileCreator: false,
+        // the child's shared code: the one typed, or the stored one
+        teacherInviteCode: input.teacherInviteCode ?? "",
         connectedTeacherEmail: input.email,
         parentEmail: current.parentEmail || input.email,
         activeChildName: input.childName ?? current.activeChildName,
@@ -1784,10 +2062,6 @@ export function SmartAACDemo() {
       return;
     }
 
-    if (authAccountType === "join" && !childAccessCode.trim()) {
-      setAuthMessage("צריך להזין קוד ילד — לפי הקוד המערכת יודעת על איזה ילד לעבוד.");
-      return;
-    }
 
     const resolved = resolveAuthFields(parentName.trim(), parentEmail.trim());
     if (resolved.swapped) {
@@ -1821,6 +2095,7 @@ export function SmartAACDemo() {
           childName: childName.trim() || "דניאל",
           childAccessCode: childAccessCode.trim(),
           knownInviteCode: state.teacherInviteCode,
+          knownChildId: state.supabaseChildId,
           functionalityLevel: state.level,
         }),
       });
@@ -1838,6 +2113,7 @@ export function SmartAACDemo() {
         childName?: string;
         linkedChildren?: Array<{ id: string; name: string }>;
         savedInSupabase?: boolean;
+        accountType?: AccountType;
       };
 
       if (!response.ok) {
@@ -1867,7 +2143,7 @@ export function SmartAACDemo() {
         childName: payload.childName,
         linkedChildren: payload.linkedChildren,
         role: authMode,
-        accountType: authAccountType,
+        accountType: payload.accountType ?? authAccountType,
       });
     } catch (error) {
       setAuthMessage(translateAuthError(getErrorMessage(error)));
@@ -1924,6 +2200,25 @@ export function SmartAACDemo() {
       setAuthMessage(translateAuthError(getErrorMessage(error)));
       setIsAuthLoading(false);
     }
+  };
+
+  // "שכחתי סיסמה": Supabase emails a link to /reset-password.
+  const sendPasswordReset = async (): Promise<void> => {
+    const email = parentEmail.trim().toLowerCase();
+    if (!email || !isValidEmail(email)) {
+      setAuthMessage("כתבו קודם את האימייל בשדה האימייל, ואז לחצו שוב על \"שכחתי סיסמה\".");
+      return;
+    }
+    if (!supabase) return;
+    setAuthMessage("שולחים מייל…");
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+    setAuthMessage(
+      error
+        ? "לא הצלחנו לשלוח את המייל. נסו שוב בעוד כמה דקות."
+        : `שלחנו ל-${email} מייל עם קישור לבחירת סיסמה חדשה. בדקו גם בספאם.`,
+    );
   };
 
   const quickParentEntry = (): void => {
@@ -2110,6 +2405,9 @@ export function SmartAACDemo() {
         onActiveChildNameChange={saveActiveChildName}
         isChildDevice={isChildDevice}
         onChildDeviceChange={setIsChildDevice}
+        onAddEvent={addEvent}
+        onDeleteEvent={deleteEvent}
+        holidayEvents={holidayEvents}
         onClose={() => {
           setIsDashboardOpen(false);
           // A child device goes straight back to the board, not the entry screen.
@@ -2216,6 +2514,7 @@ export function SmartAACDemo() {
             onCancel={() => setIsLoginOpen(false)}
             onSubmit={submitPassword}
             onQuickEntry={quickParentEntry}
+          onForgotPassword={() => void sendPasswordReset()}
           />
         )}
       </main>
@@ -2275,9 +2574,14 @@ export function SmartAACDemo() {
               const symbol = allSymbolById[symbolId];
               const label = sentenceItemLabel(symbolId, allSymbolById);
               if (!label) return null;
+              const typedPictogram = isTypedToken(symbolId)
+                ? state.typedPictograms?.[label.replace(/[?!.,]+$/, "")]
+                : undefined;
               const imageUrl = symbol
                 ? resolveSymbolImage(symbol, state.symbolImages)
-                : undefined;
+                : typedPictogram
+                  ? arasaacImageUrl(typedPictogram)
+                  : undefined;
               return (
                 <span
                   key={`${symbolId}-${index}`}
@@ -2289,7 +2593,7 @@ export function SmartAACDemo() {
                       alt={label}
                       className={cx(
                         "mx-auto h-10 w-10 object-cover",
-                        imageUrl ? "rounded-full" : "rounded-md",
+                        symbol && imageUrl ? "rounded-full" : "rounded-md",
                       )}
                     />
                   ) : (
@@ -2309,7 +2613,7 @@ export function SmartAACDemo() {
           aria-label="הקרא משפט"
           title="הקראה"
         >
-          <span className="block text-2xl">{isFixingSentence ? "✨" : "🔊"}</span>
+          <span className="block text-2xl">🔊</span>
           <span className="block text-xs">הקרא</span>
         </button>
 
@@ -2438,10 +2742,12 @@ export function SmartAACDemo() {
               .filter((symbolId) => !state.hiddenSymbolIds.includes(symbolId))
               .map((symbolId) => allSymbolById[symbolId])
               .filter(Boolean)}
+            allSymbols={allSymbols.filter((symbol) => !state.hiddenSymbolIds.includes(symbol.id))}
             symbolImages={state.symbolImages}
             onSymbolClick={addSymbol}
+            onWordClick={(word) => void addTypedText(word)}
+            childGender={childGender}
             onBack={() => setChildView({ type: "home" })}
-            onPromptClick={(prompt) => speakText(prompt)}
             onPhraseClick={(phrase) => speakText(phrase)}
           />
         )}
@@ -2451,11 +2757,21 @@ export function SmartAACDemo() {
             onBack={() => setChildView({ type: "home" })}
             onSpeak={speakText}
             speechRate={state.speechRate}
+            childGender={childGender}
           />
         )}
 
         {childView.type === "story" && (
-          <StoryGameView onBack={() => setChildView({ type: "home" })} onSpeak={speakText} />
+          <StoryGameView
+            onBack={() => setChildView({ type: "home" })}
+            onSpeak={speakText}
+            onStoryFinished={(result) =>
+              updateState((current) => ({
+                ...current,
+                storyResults: [...(current.storyResults ?? []), result].slice(-50),
+              }))
+            }
+          />
         )}
         </div>
       </section>
@@ -2485,6 +2801,7 @@ export function SmartAACDemo() {
           onCancel={() => setIsLoginOpen(false)}
           onSubmit={submitPassword}
           onQuickEntry={quickParentEntry}
+          onForgotPassword={() => void sendPasswordReset()}
         />
       )}
 
@@ -2531,6 +2848,7 @@ function LoginModal({
   onCancel,
   onSubmit,
   onQuickEntry,
+  onForgotPassword,
 }: {
   password: string;
   parentName: string;
@@ -2555,6 +2873,7 @@ function LoginModal({
   onCancel: () => void;
   onSubmit: () => void;
   onQuickEntry: () => void;
+  onForgotPassword: () => void;
 }) {
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
@@ -2565,14 +2884,14 @@ function LoginModal({
             {supabaseReady
               ? accountType === "create"
                 ? "יצירת פרופיל חדש"
-                : "הצטרפות עם קוד"
+                : "כניסה או הצטרפות עם קוד"
               : "כניסה למערכת"}
           </h2>
           <p className="text-muted">
             {supabaseReady
               ? accountType === "create"
                 ? "מלא/י אימייל וסיסמה. המערכת תיצור חשבון ופרופיל ילד חדש — ותקבל/י קוד לשתף עם מי שתרצ/י להזמין."
-                : "התחבר/י עם אימייל וסיסמה, והזינ/י את הקוד שקיבלת כדי להצטרף לילד שכבר קיים."
+                : "בפעם הראשונה: אימייל, סיסמה והקוד שקיבלת. בכניסה חוזרת מספיקים אימייל וסיסמה — גם למי שיצר את הפרופיל."
               : "אין חיבור Supabase. אפשר לנסות את לוח הבקרה בלבד, בלי שמירה בשרת."}
           </p>
         </div>
@@ -2625,7 +2944,7 @@ function LoginModal({
                 )}
                 onClick={() => onAccountTypeChange("join")}
               >
-                יש לי קוד להצטרפות
+                כניסה / יש לי קוד
               </button>
             </div>
           </div>
@@ -2694,13 +3013,13 @@ function LoginModal({
             </label>
           ) : (
             <label className="grid gap-1">
-              <span className="text-sm font-black text-slate-600">קוד הילד — בוחר איזה ילד פעיל</span>
+              <span className="text-sm font-black text-slate-600">קוד הילד (רק בפעם הראשונה)</span>
               <input
                 className="w-full rounded-2xl border border-slate-200 px-4 py-3"
                 dir="ltr"
                 value={childAccessCode}
                 onChange={(event) => onChildAccessCodeChange(event.target.value)}
-                placeholder="קוד הגישה — חובה בכל כניסה"
+                placeholder="בכניסה חוזרת אפשר להשאיר ריק"
               />
             </label>
           )}
@@ -2710,7 +3029,7 @@ function LoginModal({
           <input
             className="w-full rounded-2xl border border-slate-200 px-4 py-3"
             type="password"
-            autoComplete="new-password"
+            autoComplete="current-password"
             value={password}
             onChange={(event) => onPasswordChange(event.target.value)}
             onKeyDown={(event) => {
@@ -2719,6 +3038,15 @@ function LoginModal({
             placeholder="לפחות 6 תווים"
           />
         </label>
+        {supabaseReady && (
+          <button
+            type="button"
+            className="mt-1 text-sm font-black text-blue-700 underline"
+            onClick={onForgotPassword}
+          >
+            שכחתי סיסמה
+          </button>
+        )}
         <label className="mt-3 flex items-center gap-2 text-sm font-bold text-slate-700">
           <input
             type="checkbox"
@@ -3248,6 +3576,19 @@ function KeyboardView({
         </div>
 
         <div className="space-y-1.5 rounded-2xl bg-slate-950 p-2" dir="rtl">
+          {/* Numbers left to right, as on any keyboard; a different color from the letters. */}
+          <div className="flex justify-center gap-1" dir="ltr">
+            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map((digit) => (
+              <button
+                key={digit}
+                type="button"
+                className="min-h-12 min-w-0 flex-1 rounded-xl border-2 border-slate-900 bg-amber-100 text-xl font-black text-slate-950 shadow-sm active:scale-95 sm:min-h-14 sm:text-2xl"
+                onClick={() => appendLetter(digit)}
+              >
+                {digit}
+              </button>
+            ))}
+          </div>
           {hebrewKeyboardRows.map((row) => (
             <div key={row.join("")} className="flex justify-center gap-1">
               {row.map((letter) => (
@@ -3284,23 +3625,110 @@ function KeyboardView({
   );
 }
 
+// "אני קצת עצוב" → "אני קצת עצובה" for a girl, word by word.
+const genderSentence = (text: string, gender: "boy" | "girl"): string =>
+  text
+    .split(" ")
+    .map((word) => {
+      const core = word.replace(/[?!.,]+$/, "");
+      return genderWord(core, gender) + word.slice(core.length);
+    })
+    .join(" ");
+
+// The board symbols that appear in a sentence, so a child who can't read
+// sees "אני · רוצה · ללכת" as pictures. Matches whole words against symbol
+// labels, also without a one-letter prefix (ו/ה/ב/ל/מ/ש/כ: "וללכת" → "ללכת").
+const sentenceSymbols = (text: string, byLabel: Map<string, AacSymbol>, max = 4): AacSymbol[] => {
+  const found: AacSymbol[] = [];
+  for (const word of text.replace(/[?!.,:;״"׳'()]/g, " ").split(/\s+/)) {
+    if (!word) continue;
+    const withoutPrefix = word.length > 2 && "ובהלמשכ".includes(word.charAt(0)) ? word.slice(1) : "";
+    const symbol = byLabel.get(word) ?? (withoutPrefix ? byLabel.get(withoutPrefix) : undefined);
+    if (symbol && !found.includes(symbol)) found.push(symbol);
+    if (found.length >= max) break;
+  }
+  return found;
+};
+
+// A sentence the child taps to hear: big pictures on top, the words small
+// underneath for the adult.
+function SentenceCard({
+  text,
+  symbols,
+  fallbackEmoji,
+  symbolImages,
+  tone,
+  onClick,
+}: {
+  text: string;
+  symbols: AacSymbol[];
+  fallbackEmoji: string;
+  symbolImages: Record<string, string>;
+  tone: "amber" | "violet";
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cx(
+        "relative flex min-h-40 w-full flex-col items-center justify-center gap-3 rounded-2xl border-2 p-4 text-center shadow-sm transition active:scale-95",
+        tone === "amber" ? "border-amber-200 bg-amber-50" : "border-violet-200 bg-white",
+      )}
+      onClick={onClick}
+      aria-label={text}
+    >
+      <span className="absolute left-3 top-3 text-xl" aria-hidden>
+        🔊
+      </span>
+      <span className="flex flex-wrap items-end justify-center gap-3" aria-hidden>
+        {symbols.length === 0 ? (
+          <span className="text-6xl leading-none">{fallbackEmoji}</span>
+        ) : (
+          symbols.map((symbol) => {
+            const imageUrl = resolveSymbolImage(symbol, symbolImages);
+            return (
+              <span key={symbol.id} className="flex w-20 flex-col items-center">
+                {imageUrl || symbol.pictogramId ? (
+                  <img
+                    src={imageUrl || arasaacImageUrl(symbol.pictogramId as number)}
+                    alt=""
+                    className={cx("h-16 w-16 object-cover", imageUrl ? "rounded-full" : "rounded-md")}
+                  />
+                ) : (
+                  <span className="text-5xl leading-[4rem]">{symbol.emoji}</span>
+                )}
+                <span className="mt-1 text-xs font-black text-slate-700">{symbol.label}</span>
+              </span>
+            );
+          })
+        )}
+      </span>
+      <span className="text-sm font-bold text-slate-500">{text}</span>
+    </button>
+  );
+}
+
 function ChildEventsView({
   eventsThisWeek,
   activeTopic,
   topicSymbols,
+  allSymbols,
   symbolImages,
   onSymbolClick,
+  onWordClick,
   onBack,
-  onPromptClick,
   onPhraseClick,
+  childGender,
 }: {
+  childGender: "boy" | "girl";
   eventsThisWeek: CalendarEvent[];
+  allSymbols: AacSymbol[];
   activeTopic: { id: string; label: string; emoji: string } | undefined;
   topicSymbols: AacSymbol[];
   symbolImages: Record<string, string>;
   onSymbolClick: (symbolId: string) => void;
+  onWordClick: (word: string) => void;
   onBack: () => void;
-  onPromptClick: (prompt: string) => void;
   onPhraseClick: (phrase: string) => void;
 }) {
   const [showTopicPanel, setShowTopicPanel] = useState(false);
@@ -3310,6 +3738,76 @@ function ChildEventsView({
   );
 
   const topicSentences = activeTopic ? getWeeklyTopicSentences(activeTopic.id) : [];
+  const symbolById = useMemo(
+    () => Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])) as Record<string, AacSymbol>,
+    [allSymbols],
+  );
+  const [eventSymbols, setEventSymbols] = useState<Record<string, EventSymbolsResult>>({});
+  const [loadingKeys, setLoadingKeys] = useState<string[]>([]);
+
+  // Ask the AI once per event (and per before/on/after phase) for the symbols
+  // that fit it; answers are cached on the device.
+  const eventKeys = sortedEvents.map(eventSymbolsKey).join("\n");
+  useEffect(() => {
+    const cache = readEventSymbolsCache();
+    setEventSymbols(cache);
+    const missing = sortedEvents.filter((event) => !cache[eventSymbolsKey(event)]);
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    const vocabulary = allSymbols.map((symbol) => ({ id: symbol.id, label: symbol.label }));
+    setLoadingKeys(missing.map(eventSymbolsKey));
+    void (async () => {
+      for (const event of missing) {
+        const key = eventSymbolsKey(event);
+        try {
+          const response = await fetch("/api/event-symbols", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              event: { title: event.title, typeLabel: eventInfo(event).label, when: eventWhenLabel(event) },
+              vocabulary,
+            }),
+            signal: AbortSignal.timeout(20000),
+          });
+          const payload = (await readJsonResponse(response)) as { result?: EventSymbolsResult | null };
+          if (cancelled) return;
+          if (payload.result) {
+            const next = { ...readEventSymbolsCache(), [key]: payload.result };
+            writeEventSymbolsCache(next);
+            setEventSymbols(next);
+          }
+        } catch {
+          // keep the built-in symbols for this event
+        }
+        if (!cancelled) setLoadingKeys((current) => current.filter((item) => item !== key));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventKeys]);
+
+  const symbolsForEvent = (event: CalendarEvent): { symbols: AacSymbol[]; extraWords: EventSymbolsResult["extraWords"] } => {
+    const result = eventSymbols[eventSymbolsKey(event)];
+    const ids = result
+      ? result.symbolIds
+      : [...(FALLBACK_EVENT_SYMBOLS[event.type] ?? []), ...FALLBACK_CORE_SYMBOLS];
+    const symbols = [...new Set(ids)]
+      .map((id) => symbolById[id])
+      .filter((symbol): symbol is AacSymbol => Boolean(symbol))
+      .slice(0, MAX_EVENT_SYMBOLS);
+    return { symbols, extraWords: result?.extraWords ?? [] };
+  };
+
+  const symbolByLabel = useMemo(() => {
+    const map = new Map<string, AacSymbol>();
+    allSymbols.forEach((symbol) => {
+      if (!map.has(symbol.label)) map.set(symbol.label, symbol);
+    });
+    return map;
+  }, [allSymbols]);
 
   return (
     <div className="flex min-h-full flex-col">
@@ -3323,7 +3821,7 @@ function ChildEventsView({
         </button>
         <div>
           <h2 className="text-3xl font-black">🗓️ לוח אירועים</h2>
-          <p className="text-muted">שאלות ומשפטים לפי מה שקורה היום, לפני אירוע או אחרי אירוע.</p>
+          <p className="text-muted">לכל אירוע יש סמלים משלו. לוחצים על סמלים כדי לדבר על האירוע.</p>
         </div>
       </div>
 
@@ -3357,17 +3855,17 @@ function ChildEventsView({
       )}
 
       {showTopicPanel && (
-        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {topicSentences.map((sentence, index) => (
-            <button
+            <SentenceCard
               key={`topic-${sentence.text}-${index}`}
-              type="button"
-              className="flex min-h-24 items-center gap-4 rounded-soft border border-violet-200 bg-white p-5 text-right shadow-sm"
-              onClick={() => onPhraseClick(sentence.text)}
-            >
-              <span className="text-4xl">{sentence.emoji}</span>
-              <span className="text-xl font-black">{sentence.text}</span>
-            </button>
+              text={genderSentence(sentence.text, childGender)}
+              symbols={sentenceSymbols(sentence.text, symbolByLabel)}
+              fallbackEmoji={sentence.emoji}
+              symbolImages={symbolImages}
+              tone="violet"
+              onClick={() => onPhraseClick(genderSentence(sentence.text, childGender))}
+            />
           ))}
         </div>
       )}
@@ -3385,7 +3883,8 @@ function ChildEventsView({
               : distance > 0
                 ? `בעוד ${distance} ימים`
                 : `לפני ${Math.abs(distance)} ימים`;
-          const prompts = getEventPrompts(event);
+          const { symbols: eventBoard, extraWords } = symbolsForEvent(event);
+          const isLoadingSymbols = loadingKeys.includes(eventSymbolsKey(event));
 
           return (
             <article
@@ -3394,26 +3893,39 @@ function ChildEventsView({
             >
               <div className="mb-4 flex items-center gap-3">
                 <span className="grid h-16 w-16 place-items-center rounded-2xl bg-blue-50 text-4xl">
-                  {eventLabels[event.type].emoji}
+                  {eventInfo(event).emoji}
                 </span>
                 <div>
                   <h3 className="text-2xl font-black">{event.title}</h3>
                   <p className="text-muted">
-                    {eventLabels[event.type].label} · {when}
+                    {eventInfo(event).label} · {when}
                   </p>
                 </div>
               </div>
-              <div className="grid gap-2">
-                {prompts.map((prompt) => (
+              {isLoadingSymbols && (
+                <p className="mb-2 text-sm font-bold text-violet-700">✨ מכינים סמלים שמתאימים לאירוע…</p>
+              )}
+              <div className="grid grid-cols-3 gap-3 sm:grid-cols-4">
+                {eventBoard.map((symbol) => (
+                  <SymbolTile
+                    key={`${event.id}-${symbol.id}`}
+                    symbol={symbol}
+                    imageUrl={resolveSymbolImage(symbol, symbolImages)}
+                    variant="home"
+                    onClick={() => onSymbolClick(symbol.id)}
+                  />
+                ))}
+                {extraWords.map((word) => (
                   <button
-                    key={prompt}
+                    key={`${event.id}-word-${word.label}`}
                     type="button"
-                    className="flex w-full items-center gap-4 rounded-2xl bg-amber-50 p-4 text-right shadow-sm"
-                    onClick={() => onPromptClick(prompt)}
+                    className="rounded-xl border-2 border-slate-300 bg-white p-2 text-center shadow-soft ring-1 ring-slate-900/5 transition active:scale-95"
+                    onClick={() => onWordClick(word.label)}
                   >
-                    <span className="text-3xl">💬</span>
-                    <span className="text-lg font-black">{prompt}</span>
-                    <span className="mr-auto text-2xl">🔊</span>
+                    <span className="block text-3xl leading-none md:text-4xl">{word.emoji}</span>
+                    <span className="mt-1.5 block text-sm font-black leading-4 text-slate-950 md:text-base">
+                      {word.label}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -3445,10 +3957,34 @@ async function loadAiStory(avoidTitles: string[]): Promise<Story | null> {
 function StoryGameView({
   onBack,
   onSpeak,
+  onStoryFinished,
 }: {
   onBack: () => void;
   onSpeak: (text: string, onEnd?: () => void) => void;
+  onStoryFinished: (result: StoryResult) => void;
 }) {
+  // Per-story tally for the progress page: right word on the first tap, and
+  // how many wrong words were tapped along the way.
+  const tallyRef = useRef({ title: "", firstTry: 0, wrongTaps: 0, answered: 0, reported: false });
+  const onStoryFinishedRef = useRef(onStoryFinished);
+  onStoryFinishedRef.current = onStoryFinished;
+
+  // A story the child left in the middle still counts for the day, with the
+  // words they got to.
+  const reportPartial = (): void => {
+    const tally = tallyRef.current;
+    if (tally.reported || tally.answered === 0) return;
+    tally.reported = true;
+    onStoryFinishedRef.current({
+      date: today(),
+      title: tally.title,
+      steps: tally.answered,
+      firstTry: tally.firstTry,
+      wrongTaps: tally.wrongTaps,
+      partial: true,
+    });
+  };
+  useEffect(() => () => reportPartial(), []);
   const [story, setStory] = useState<Story>(() => pickLocalStory());
   const [stepIndex, setStepIndex] = useState(0);
   // True once the current step's word was picked, while its full sentence is read.
@@ -3470,6 +4006,16 @@ function StoryGameView({
       setStepIndex(current.steps.length);
       setNarrating(false);
       setFinished(true);
+      if (!tallyRef.current.reported) {
+        tallyRef.current.reported = true;
+        onStoryFinished({
+          date: today(),
+          title: current.title,
+          steps: current.steps.length,
+          firstTry: tallyRef.current.firstTry,
+          wrongTaps: tallyRef.current.wrongTaps,
+        });
+      }
       window.setTimeout(() => onSpeak(STORY_ENDING_LINE), 300);
       return;
     }
@@ -3481,7 +4027,9 @@ function StoryGameView({
   };
 
   const startStory = (next: Story): void => {
+    reportPartial();
     setStory(next);
+    tallyRef.current = { title: next.title, firstTry: 0, wrongTaps: 0, answered: 0, reported: false };
     setStepIndex(0);
     setStepAnswered(false);
     setFinished(false);
@@ -3504,12 +4052,15 @@ function StoryGameView({
     if (!step) return;
 
     if (choice.kind !== "correct") {
+      tallyRef.current.wrongTaps += 1;
       setStepHadMistake(true);
       setFeedback(STORY_FEEDBACK.wrong);
       onSpeak(STORY_FEEDBACK.wrong);
       return;
     }
 
+    if (!stepHadMistake) tallyRef.current.firstTry += 1;
+    tallyRef.current.answered += 1;
     setFeedback(STORY_FEEDBACK.correct);
     setStepAnswered(true);
     setNarrating(true);
@@ -3617,37 +4168,42 @@ function StoryGameView({
   );
 }
 
-// Aided language modeling: instead of forcing the child to type or speak every
-// turn, offer a few tappable replies matching what the assistant just said.
-const getQuickReplyOptions = (lastAssistantContent: string): string[] =>
-  lastAssistantContent.includes("?")
-    ? ["כן", "לא", "אולי"]
-    : ["ספרו לי עוד", "זהו, סיימתי", "יש לי שאלה"];
-
 function VoiceAssistantView({
   onBack,
   onSpeak,
   speechRate,
+  childGender,
 }: {
   onBack: () => void;
   onSpeak: (text: string) => void;
   speechRate: number;
+  childGender: "boy" | "girl";
 }) {
+  const welcome = `שלום, אני כאן כדי לדבר איתך. מה ${childGender === "girl" ? "תרצי" : "תרצה"} לספר לי?`;
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<AiChatMessage[]>([
     {
       id: "welcome",
       role: "assistant",
-      content: "שלום, אני כאן כדי לדבר איתך. מה תרצי לספר לי?",
+      content: welcome,
     },
   ]);
-  const [answer, setAnswer] = useState("שלום, אני כאן כדי לדבר איתך. מה תרצי לספר לי?");
+  const [answer, setAnswer] = useState(welcome);
   const [isRecording, setIsRecording] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
-  const [speechHint, setSpeechHint] = useState("");
+  // Status notes ("מצב בסיסי…", mic problems) are not shown to the child —
+  // they only go to the developer console.
+  const setSpeechHint = (note: string): void => {
+    if (note) console.info("smartaac:", note);
+  };
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
+  // Live microphone level (0–1) while recording, so the user sees whether the
+  // mic actually hears them — a silent mic is why recordings came back "תודה".
+  const [micLevel, setMicLevel] = useState(0);
+  const [micSilent, setMicSilent] = useState(false);
+  const meterStopRef = useRef<(() => void) | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const recordingStartedAtRef = useRef<number>(0);
   const replyAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -3744,6 +4300,7 @@ function VoiceAssistantView({
         body: JSON.stringify({
           message: cleanText,
           history: historyForRequest,
+          gender: childGender,
         }),
       });
       const data = response.ok ? ((await response.json()) as ChildAiResponse) : {};
@@ -3837,8 +4394,7 @@ function VoiceAssistantView({
     if (isRecording || isThinking) return;
 
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      appendAssistantMessage("הדפדפן לא תומך בהקלטת דיבור. כתב/י את המשפט ולחצ/י שלח.");
-      setSpeechHint("הקלטה לא נתמכת");
+      setSpeechHint("הדפדפן לא תומך בהקלטת דיבור");
       return;
     }
 
@@ -3855,6 +4411,35 @@ function VoiceAssistantView({
       micStreamRef.current = stream;
       audioChunksRef.current = [];
       recordingStartedAtRef.current = Date.now();
+
+      try {
+        const meterContext = new AudioContext();
+        const analyser = meterContext.createAnalyser();
+        analyser.fftSize = 1024;
+        meterContext.createMediaStreamSource(stream).connect(analyser);
+        const samples = new Float32Array(analyser.fftSize);
+        let loudest = 0;
+        let frame = 0;
+        const startedAt = Date.now();
+        const tick = (): void => {
+          analyser.getFloatTimeDomainData(samples);
+          let peak = 0;
+          for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+          loudest = Math.max(loudest, peak);
+          setMicLevel(Math.min(1, peak * 4));
+          // after 2.5 s with nothing above a whisper, warn while still recording
+          setMicSilent(Date.now() - startedAt > 2500 && loudest < SILENCE_PEAK);
+          frame = requestAnimationFrame(tick);
+        };
+        frame = requestAnimationFrame(tick);
+        meterStopRef.current = () => {
+          cancelAnimationFrame(frame);
+          void meterContext.close();
+          setMicLevel(0);
+        };
+      } catch {
+        // no meter — recording still works
+      }
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
@@ -3875,6 +4460,9 @@ function VoiceAssistantView({
       };
 
       recorder.onstop = () => {
+        meterStopRef.current?.();
+        meterStopRef.current = null;
+        setMicSilent(false);
         micStreamRef.current?.getTracks().forEach((track) => track.stop());
         micStreamRef.current = null;
         mediaRecorderRef.current = null;
@@ -3900,16 +4488,27 @@ function VoiceAssistantView({
           try {
             let uploadBlob: Blob = blob;
             let fileName = `speech.${audioExtensionForMime(mimeType)}`;
+            let recordingPeak: number | null = null;
 
             try {
-              uploadBlob = await recordingToWavBlob(blob);
+              const converted = await recordingToWavBlob(blob);
+              if (converted.peak < SILENCE_PEAK) {
+                // Don't send silence: the speech model would invent words for it.
+                setSpeechHint(
+                  "לא שמעתי קול בהקלטה. דבר/י קרוב יותר, ובדק/י שבחרת את המיקרופון הנכון (סמל המנעול ליד כתובת האתר).",
+                );
+                return;
+              }
+              uploadBlob = converted.wav;
               fileName = "speech.wav";
+              recordingPeak = converted.peak;
             } catch {
               // keep original recording for cloud fallbacks
             }
 
             const formData = new FormData();
             formData.append("audio", uploadBlob, fileName);
+            if (recordingPeak !== null) formData.append("peak", String(recordingPeak));
 
             const response = await fetch("/api/speech-to-text", {
               method: "POST",
@@ -3943,9 +4542,6 @@ function VoiceAssistantView({
       setIsRecording(true);
       setSpeechHint("מקליט... דבר/י, ואז לחצ/י סיום דיבור");
     } catch {
-      appendAssistantMessage(
-        "צריך לאשר מיקרופון. לחצ/י על סמל המנעול ליד הכתובת, אשר/י מיקרופון, ואז נס/י שוב.",
-      );
       setSpeechHint("מיקרופון לא מאושר");
     }
   };
@@ -3958,10 +4554,6 @@ function VoiceAssistantView({
     void startRecording();
   };
 
-  const lastAssistantMessage = [...messages].reverse().find((item) => item.role === "assistant");
-  const quickReplyOptions = lastAssistantMessage
-    ? getQuickReplyOptions(lastAssistantMessage.content)
-    : [];
 
   return (
     <div className="flex min-h-full flex-col">
@@ -4012,23 +4604,6 @@ function VoiceAssistantView({
             )}
           </div>
 
-          {!isThinking && quickReplyOptions.length > 0 && (
-            <div className="mb-4 flex flex-wrap gap-2">
-              {quickReplyOptions.map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  className="rounded-full bg-blue-100 px-4 py-2 text-sm font-black text-blue-900 shadow-sm active:scale-95"
-                  onClick={() => {
-                    void answerChild(option);
-                  }}
-                >
-                  {option}
-                </button>
-              ))}
-            </div>
-          )}
-
           <label className="mb-2 block text-sm font-black text-muted">
             המשך שיחה
           </label>
@@ -4047,6 +4622,19 @@ function VoiceAssistantView({
             >
               {isRecording ? "⏹ סיום דיבור" : "🎤 התחלת דיבור"}
             </button>
+            {isRecording && (
+              <div className="flex min-w-40 flex-col justify-center gap-1" aria-label="עוצמת המיקרופון">
+                <div className="h-3 overflow-hidden rounded-full bg-slate-200">
+                  <div
+                    className={cx("h-full rounded-full transition-[width]", micSilent ? "bg-red-400" : "bg-emerald-500")}
+                    style={{ width: `${Math.max(4, Math.round(micLevel * 100))}%` }}
+                  />
+                </div>
+                <span className={cx("text-xs font-bold", micSilent ? "text-red-700" : "text-muted")}>
+                  {micSilent ? "המיקרופון לא קולט קול" : "המיקרופון שומע אותך"}
+                </span>
+              </div>
+            )}
             <button
               type="button"
               className="rounded-2xl bg-blue-500 px-6 py-4 text-lg font-black text-white shadow-soft"
@@ -4058,26 +4646,42 @@ function VoiceAssistantView({
               {isThinking ? "חושב..." : "שלח"}
             </button>
           </div>
-          {speechHint && (
-            <p className="mt-3 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-bold leading-6 text-amber-900">
-              {speechHint}
-            </p>
-          )}
-          <p className="mt-3 text-sm text-muted">
-            דיבור עובד ב-Chrome/Edge עם אישור מיקרופון. אם לא עובד — כתבו ולחצו שלח.
-          </p>
           <div className="mt-4 flex flex-wrap gap-2">
-            {["אני רוצה מים", "אני עייפה", "קשה לי", "אני רוצה לשחק"].map((starter) => (
+            {[
+              { text: "אני רוצה מים", symbolIds: ["i", "want", "water"] },
+              { text: `אני ${genderWord("עייף", childGender)}`, symbolIds: ["i", "tired"] },
+              { text: "קשה לי", symbolIds: ["i", "help"] },
+              { text: "אני רוצה לשחק", symbolIds: ["i", "want", "play"] },
+            ].map((starter) => (
+              // Pictures first, so a child who can't read can pick one.
               <button
-                key={starter}
+                key={starter.text}
                 type="button"
-                className="rounded-full bg-slate-100 px-4 py-2 text-sm font-black text-slate-700"
+                className="flex flex-col items-center gap-1 rounded-2xl border-2 border-slate-200 bg-white px-3 py-2 shadow-sm transition active:scale-95"
                 onClick={() => {
-                  setMessage(starter);
-                  void answerChild(starter);
+                  setMessage(starter.text);
+                  void answerChild(starter.text);
                 }}
+                aria-label={starter.text}
               >
-                {starter}
+                <span className="flex items-end gap-1" aria-hidden>
+                  {starter.symbolIds.map((symbolId) => {
+                    const symbol = symbols.find((item) => item.id === symbolId);
+                    return symbol?.pictogramId ? (
+                      <img
+                        key={symbolId}
+                        src={arasaacImageUrl(symbol.pictogramId)}
+                        alt=""
+                        className="h-12 w-12 rounded-md object-contain"
+                      />
+                    ) : (
+                      <span key={symbolId} className="text-4xl leading-[3rem]">
+                        {symbol?.emoji}
+                      </span>
+                    );
+                  })}
+                </span>
+                <span className="text-xs font-bold text-slate-500">{starter.text}</span>
               </button>
             ))}
           </div>
@@ -4093,7 +4697,7 @@ function VoiceAssistantView({
             className="mt-4 rounded-2xl bg-slate-950 px-6 py-4 font-black text-white"
             onClick={() => { void speakReply(answer); }}
           >
-            הקרא שוב
+            🔊 הקרא שוב
           </button>
           <button
             type="button"
@@ -4287,69 +4891,6 @@ const openTeacherInviteMail = (input: {
 };
 
 
-function ChildNameEditor({
-  activeChildName,
-  isRegisteredInSupabase,
-  onSave,
-}: {
-  activeChildName: string;
-  isRegisteredInSupabase: boolean;
-  onSave: (name: string) => Promise<void>;
-}) {
-  const [draftName, setDraftName] = useState(activeChildName);
-  const [message, setMessage] = useState("");
-  const [isSaving, setIsSaving] = useState(false);
-
-  useEffect(() => {
-    setDraftName(activeChildName);
-  }, [activeChildName]);
-
-  return (
-    <div className="mb-6 rounded-soft border border-violet-100 bg-violet-50 p-5 shadow-sm">
-      <h2 className="text-xl font-black">שם הילד/ה המיוחד/ת</h2>
-      <p className="mt-1 text-sm text-muted">ההורה והמורה יכולים לבחור את השם שמופיע במסך הילד.</p>
-      <div className="mt-4 flex flex-wrap items-end gap-3">
-        <label className="min-w-56 flex-1">
-          <span className="mb-2 block text-sm font-black text-slate-700">שם הילד/ה</span>
-          <input
-            className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-lg font-black"
-            value={draftName}
-            onChange={(event) => setDraftName(event.target.value)}
-            placeholder="למשל: דניאל"
-          />
-        </label>
-        <button
-          type="button"
-          className="rounded-2xl bg-violet-600 px-5 py-3 font-black text-white disabled:opacity-60"
-          disabled={isSaving || !draftName.trim()}
-          onClick={() => {
-            setMessage("");
-            setIsSaving(true);
-            void onSave(draftName.trim())
-              .then(() => setMessage("השם נשמר."))
-              .catch((error: unknown) => {
-                setMessage(error instanceof Error ? error.message : "לא הצלחנו לשמור את השם.");
-              })
-              .finally(() => {
-                setIsSaving(false);
-              });
-          }}
-        >
-          {isSaving ? "שומר..." : "שמירת שם"}
-        </button>
-      </div>
-      {message && (
-        <p className="mt-3 rounded-2xl bg-white px-4 py-2 text-sm font-bold text-violet-900 shadow-sm">
-          {message}
-        </p>
-      )}
-      {isRegisteredInSupabase && (
-        <p className="mt-2 text-xs text-muted">השם נשמר גם ב-Supabase.</p>
-      )}
-    </div>
-  );
-}
-
 function Dashboard({
   view,
   state,
@@ -4367,6 +4908,9 @@ function Dashboard({
   onActiveChildNameChange,
   isChildDevice,
   onChildDeviceChange,
+  onAddEvent,
+  onDeleteEvent,
+  holidayEvents,
   onClose,
 }: {
   view: DashboardView;
@@ -4385,6 +4929,9 @@ function Dashboard({
   onActiveChildNameChange: (name: string) => Promise<void>;
   isChildDevice: boolean;
   onChildDeviceChange: (enabled: boolean) => void;
+  onAddEvent: (event: Omit<CalendarEvent, "id">) => void;
+  onDeleteEvent: (eventId: string) => void;
+  holidayEvents: CalendarEvent[];
   onClose: () => void;
 }) {
   const [codeMessage, setCodeMessage] = useState("");
@@ -4394,12 +4941,14 @@ function Dashboard({
     state.dashboardRole === "teacher" ? "parent" : "teacher",
   );
   const inviteeLabel = inviteeRole === "teacher" ? "מורה" : "הורה";
+  // progress from all of the child's devices together
+  const combined = withCombinedUsage(state);
   const averageLength =
-    state.sentenceLengths.length === 0
+    combined.sentenceLengths.length === 0
       ? "0.0"
       : (
-          state.sentenceLengths.reduce((total, value) => total + value, 0) /
-          state.sentenceLengths.length
+          combined.sentenceLengths.reduce((total, value) => total + value, 0) /
+          combined.sentenceLengths.length
         ).toFixed(1);
   const nextEvent = state.events
     .filter((event) => new Date(event.date).getTime() >= new Date(today()).getTime())
@@ -4415,8 +4964,7 @@ function Dashboard({
         <div className="mb-4 px-2 text-2xl font-black">🧩 SmartAAC</div>
         {[
           ["overview", "📊", "סקירה"],
-          ["calendar", "🗓️", "לוח שנה"],
-          ["events", "📅", "אירועים"],
+          ["events", "📅", "אירועים ולוח שנה"],
           ["topic", "📚", "נושא שבועי"],
           ["level", "🎚️", "רמת תפקוד"],
           ["symbols", "🔣", "סמלים"],
@@ -4456,16 +5004,48 @@ function Dashboard({
               childName={state.activeChildName}
               onChange={onChildDeviceChange}
             />
-            <ChildNameEditor
-              activeChildName={state.activeChildName}
-              isRegisteredInSupabase={state.isRegisteredInSupabase}
-              onSave={onActiveChildNameChange}
-            />
+            <div className="mb-6 flex flex-wrap items-center gap-3 rounded-soft border border-violet-200 bg-white p-4 shadow-sm">
+              <span className="font-black">{state.activeChildName || "הילד/ה"} הוא/היא:</span>
+              {(
+                [
+                  ["boy", "👦 בן"],
+                  ["girl", "👧 בת"],
+                ] as const
+              ).map(([gender, label]) => (
+                <button
+                  key={gender}
+                  type="button"
+                  className={cx(
+                    "rounded-2xl border px-4 py-2 font-black",
+                    (state.childGender ?? "boy") === gender
+                      ? "border-violet-600 bg-violet-600 text-white"
+                      : "border-violet-200 bg-white text-violet-950",
+                  )}
+                  onClick={() => update((current) => ({ ...current, childGender: gender }))}
+                >
+                  {label}
+                </button>
+              ))}
+              <span className="text-sm text-muted">
+                המערכת תפנה לילד/ה ותקריא את המילים בלשון המתאימה.
+              </span>
+              <label className="mr-auto flex items-center gap-2 font-black">
+                <input
+                  type="checkbox"
+                  className="h-5 w-5"
+                  checked={state.smartGrammar !== false}
+                  onChange={(event) =>
+                    update((current) => ({ ...current, smartGrammar: event.target.checked }))
+                  }
+                />
+                ✨ תיקון משפטים חכם (AI)
+              </label>
+            </div>
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <Metric label="ילד/ה פעיל/ה" value={state.activeChildName || "לא הוגדר"} />
               <Metric label="רמת תפקוד" value={levelLabels[state.level]} />
               <Metric label="נושא שבועי" value={`${activeTopic?.emoji ?? ""} ${activeTopic?.label ?? "-"}`} />
-              <Metric label="משפטים שנבנו" value={String(state.sentenceCount)} />
+              <Metric label="משפטים שנבנו" value={String(combined.sentenceCount)} />
             </div>
             <div className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <Metric label="סמלים פעילים" value={String(allSymbols.length - state.hiddenSymbolIds.length)} />
@@ -4473,48 +5053,9 @@ function Dashboard({
             <div className="mt-6 grid gap-4 xl:grid-cols-2">
               <div className="rounded-soft border border-blue-100 bg-blue-50 p-5 shadow-sm">
                 <h2 className="text-xl font-black">
-                  {state.dashboardRole === "teacher" && !state.isProfileCreator
-                    ? "חיבור מורה"
-                    : "חיבור הורה ומורה"}
+                  צוות הילד/ה — הורים ומורים
                 </h2>
-                {state.dashboardRole === "teacher" && !state.isProfileCreator ? (
-                  <>
-                    <p className="mt-2 text-muted">
-                      מחוברת כמורה · {state.connectedTeacherEmail || state.parentEmail || "לא הוגדר אימייל"}
-                    </p>
-                    <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
-                      <span className="block text-sm font-black text-muted">עובדת עכשיו עם</span>
-                      <span className="mt-1 block text-3xl font-black">{state.activeChildName || "—"}</span>
-                    </div>
-                    <span className="mt-3 inline-flex rounded-full bg-emerald-100 px-4 py-2 text-sm font-black text-emerald-800">
-                      {state.isRegisteredInSupabase ? "מחוברת לילד ב-Supabase" : "כניסה מקומית"}
-                    </span>
-                    {state.linkedChildren.length > 0 && (
-                      <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
-                        <span className="block text-sm font-black text-muted">כל הילדים שאת אחראית עליהם</span>
-                        <div className="mt-2 space-y-2">
-                          {state.linkedChildren.map((child) => (
-                            <div
-                              key={child.id}
-                              className={cx(
-                                "rounded-xl px-3 py-2 text-sm font-bold",
-                                child.id === state.supabaseChildId
-                                  ? "bg-emerald-100 text-emerald-900"
-                                  : "bg-slate-100 text-slate-700",
-                              )}
-                            >
-                              {child.name}
-                              {child.id === state.supabaseChildId ? " · פעיל/ה עכשיו" : ""}
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    <p className="mt-4 rounded-2xl bg-white p-4 text-sm leading-7 text-muted shadow-sm">
-                      בכל כניסה הזינ/י את קוד הילד — לפי הקוד המערכת יודעת על מי לעבוד. כך אפשר לנהל כמה ילדים.
-                    </p>
-                  </>
-                ) : (
+                {(
                   <>
                     <p className="mt-2 text-muted">
                       {state.parentName || (state.dashboardRole === "teacher" ? "מורה" : "הורה")} ·{" "}
@@ -4580,9 +5121,14 @@ function Dashboard({
                       </label>
                     </div>
                     <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
-                      <span className="block text-sm font-black text-muted">סיסמת הגישה לילד/ה (קוד)</span>
-                      <span className="mt-1 block text-3xl font-black tracking-widest">
-                        {state.teacherInviteCode}
+                      <span className="block text-sm font-black text-muted">
+                        קוד הילד/ה — אותו קוד לכל ההורים והמורים
+                      </span>
+                      <span className="mt-1 block text-3xl font-black tracking-widest" dir="ltr">
+                        {state.teacherInviteCode || "—"}
+                      </span>
+                      <span className="mt-2 block text-xs leading-5 text-muted">
+                        מי שמקבל/ת את הקוד נכנס/ת איתו לאותו ילד/ה, ורואה את אותן תמונות, הגדרות ואירועים.
                       </span>
                     </div>
                     <button
@@ -4606,11 +5152,13 @@ function Dashboard({
                     >
                       {isSendingInvite ? "שולח..." : `שלח/י ל${inviteeLabel} מייל עם סיסמת הגישה`}
                     </button>
+                    {state.isProfileCreator && (
                     <button
                       type="button"
                       className="mt-4 rounded-2xl bg-blue-600 px-5 py-3 font-black text-white disabled:opacity-60"
                       disabled={isRotatingCode}
                       onClick={() => {
+                        if (!window.confirm("קוד חדש מבטל את הקוד הנוכחי. מי שעוד לא הצטרף יצטרך את הקוד החדש. להמשיך?")) return;
                         setCodeMessage("");
                         setIsRotatingCode(true);
                         void onRotateTeacherCode()
@@ -4631,6 +5179,7 @@ function Dashboard({
                     >
                       {isRotatingCode ? "יוצר קוד..." : "צור קוד גישה חדש"}
                     </button>
+                    )}
                     {codeMessage && (
                       <p className="mt-3 rounded-2xl bg-white p-3 text-sm font-bold text-blue-900 shadow-sm">
                         {codeMessage}
@@ -4648,7 +5197,7 @@ function Dashboard({
                 <h2 className="text-xl font-black">האירוע הקרוב</h2>
                 <p className="mt-2 text-muted">
                   {nextEvent
-                    ? `${eventLabels[nextEvent.type].emoji} ${nextEvent.title} · ${nextEvent.date}`
+                    ? `${eventInfo(nextEvent).emoji} ${nextEvent.title} · ${nextEvent.date}`
                     : "אין אירועים קרובים. אפשר להוסיף בלשונית אירועים."}
                 </p>
               </div>
@@ -4662,19 +5211,16 @@ function Dashboard({
           </section>
         )}
 
-        {view === "calendar" && (
-          <CalendarDashboard
-            events={state.events}
-            onDeleteEvent={(eventId) =>
-              update((current) => ({
-                ...current,
-                events: current.events.filter((event) => event.id !== eventId),
-              }))
-            }
+        {view === "events" && (
+          <EventsDashboard
+            state={state}
+            update={update}
+            holidayEvents={holidayEvents}
+            onAddEvent={onAddEvent}
+            onDeleteEvent={onDeleteEvent}
           />
         )}
-        {view === "events" && <EventsDashboard state={state} update={update} />}
-        {view === "topic" && <TopicDashboard state={state} update={update} />}
+        {view === "topic" && <TopicDashboard state={state} allSymbols={allSymbols} update={update} />}
         {view === "level" && <LevelDashboard state={state} update={update} />}
         {view === "symbols" && (
           <SymbolsDashboard
@@ -4690,7 +5236,7 @@ function Dashboard({
         )}
         {view === "progress" && (
           <ProgressDashboard
-            state={state}
+            state={combined}
             activeTopic={activeTopic}
             averageLength={averageLength}
             allSymbolById={allSymbolById}
@@ -4711,14 +5257,21 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function CalendarDashboard({
+function EventsCalendar({
   events,
+  selectedDate,
+  onPickDate,
   onDeleteEvent,
 }: {
   events: CalendarEvent[];
+  selectedDate: string;
+  onPickDate: (date: string) => void;
   onDeleteEvent: (eventId: string) => void;
 }) {
+  const [monthOffset, setMonthOffset] = useState(0);
   const now = new Date();
+  now.setDate(1);
+  now.setMonth(now.getMonth() + monthOffset);
   const year = now.getFullYear();
   const month = now.getMonth();
   const firstDay = new Date(year, month, 1);
@@ -4738,24 +5291,36 @@ function CalendarDashboard({
     ...Array.from({ length: leadingEmptyDays }, () => ({ day: null, dateKey: null })),
     ...Array.from({ length: daysInMonth }, (_, index) => {
       const dayNumber = index + 1;
-      const date = new Date(year, month, dayNumber);
+      // Built from the numbers, not toISOString(): in Israel (UTC+2/3) local
+      // midnight is the previous day in UTC, which shifted every event a day.
       return {
         day: dayNumber,
-        dateKey: date.toISOString().slice(0, 10),
+        dateKey: `${year}-${String(month + 1).padStart(2, "0")}-${String(dayNumber).padStart(2, "0")}`,
       };
     }),
   ];
 
   return (
-    <section>
-      <h1 className="text-3xl font-black">לוח שנה</h1>
-      <p className="mb-6 text-muted">
-        הלוח מיועד להורה ולמטפל בלבד. הילד לא רואה יומן, אלא מקבל הצעות עדינות לפי האירועים.
-      </p>
-      <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="mb-5 flex items-center justify-between">
+      <div className="mb-6 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="mb-5 flex items-center gap-3">
+          <button
+            type="button"
+            className="rounded-full bg-slate-100 px-3 py-1 text-lg font-black"
+            onClick={() => setMonthOffset((current) => current - 1)}
+            aria-label="החודש הקודם"
+          >
+            →
+          </button>
           <h2 className="text-2xl font-black">{monthLabel}</h2>
-          <span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-black text-blue-700">
+          <button
+            type="button"
+            className="rounded-full bg-slate-100 px-3 py-1 text-lg font-black"
+            onClick={() => setMonthOffset((current) => current + 1)}
+            aria-label="החודש הבא"
+          >
+            ←
+          </button>
+          <span className="mr-auto rounded-full bg-blue-50 px-4 py-2 text-sm font-black text-blue-700">
             {events.length} אירועים
           </span>
         </div>
@@ -4773,7 +5338,11 @@ function CalendarDashboard({
                 className={cx(
                   "min-h-28 rounded-2xl border border-slate-100 bg-slate-50 p-2",
                   dayEvents.length > 0 && "bg-blue-50 ring-2 ring-blue-100",
+                  cell.dateKey !== null && cell.dateKey === selectedDate && "border-blue-500 ring-2 ring-blue-300",
+                  cell.dateKey !== null && "cursor-pointer",
                 )}
+                onClick={() => cell.dateKey && onPickDate(cell.dateKey)}
+                title={cell.dateKey ? "בחירת התאריך לאירוע חדש" : undefined}
               >
                 {cell.day && <div className="mb-2 font-black">{cell.day}</div>}
                 <div className="space-y-1">
@@ -4783,16 +5352,21 @@ function CalendarDashboard({
                       className="flex items-center gap-1 rounded-full bg-white px-2 py-1 text-xs font-bold"
                     >
                       <span className="truncate">
-                        {eventLabels[event.type].emoji} {event.title}
+                        {eventInfo(event).emoji} {event.title}
                       </span>
+                      {!event.id.startsWith("holiday-") && (
                       <button
                         type="button"
                         className="mr-auto rounded-full bg-red-50 px-1 text-red-700"
-                        onClick={() => onDeleteEvent(event.id)}
+                        onClick={(clickEvent) => {
+                          clickEvent.stopPropagation();
+                          onDeleteEvent(event.id);
+                        }}
                         aria-label={`מחק ${event.title}`}
                       >
                         ×
                       </button>
+                      )}
                     </div>
                   ))}
                   {dayEvents.length > 2 && (
@@ -4804,19 +5378,26 @@ function CalendarDashboard({
           })}
         </div>
       </div>
-    </section>
   );
 }
 
 function EventsDashboard({
   state,
+  onAddEvent,
+  onDeleteEvent: deleteEvent,
   update,
+  holidayEvents,
 }: {
   state: DemoState;
+  onAddEvent: (event: Omit<CalendarEvent, "id">) => void;
+  onDeleteEvent: (eventId: string) => void;
   update: (updater: (current: DemoState) => DemoState) => void;
+  holidayEvents: CalendarEvent[];
 }) {
   const [title, setTitle] = useState("");
   const [type, setType] = useState<CalendarEvent["type"]>("trip");
+  const [customLabel, setCustomLabel] = useState("");
+  const [customEmoji, setCustomEmoji] = useState(EVENT_EMOJI_CHOICES[0] ?? "📌");
   const [date, setDate] = useState(today());
   const [formError, setFormError] = useState("");
 
@@ -4831,25 +5412,31 @@ function EventsDashboard({
       return;
     }
 
-    update((current) => ({
-      ...current,
-      events: [
-        ...current.events,
-        { id: createLocalId("event"), title: trimmedTitle, type, date },
-      ],
-    }));
+    if (type === "custom" && !customLabel.trim()) {
+      setFormError("הזינ/י שם לסוג האירוע, למשל: רופא שיניים.");
+      return;
+    }
+
+    onAddEvent(
+      type === "custom"
+        ? { title: trimmedTitle, type, date, customLabel: customLabel.trim(), customEmoji }
+        : { title: trimmedTitle, type, date },
+    );
     setTitle("");
     setFormError("");
   };
 
   return (
     <section>
-      <h1 className="text-3xl font-black">אירועים</h1>
-      <p className="mb-6 text-muted">האירועים משפיעים על ההצעות, לא מוצגים לילד כלוח שנה.</p>
+      <h1 className="text-3xl font-black">אירועים ולוח שנה</h1>
+      <p className="mb-6 text-muted">
+        האירועים של {state.activeChildName || "הילד/ה"} בלבד. הם נשמרים לכל ילד בנפרד, ומשפיעים על
+        המשפטים שמוצעים לו. לחיצה על יום בלוח בוחרת אותו לאירוע חדש.
+      </p>
 
       <div className="mb-6 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
         <h2 className="mb-4 text-xl font-black">הוספת אירוע חדש</h2>
-        <div className="mb-4 grid gap-3 md:grid-cols-5">
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-6">
           {Object.entries(eventLabels).map(([id, item]) => (
             <button
               key={id}
@@ -4862,11 +5449,42 @@ function EventsDashboard({
             )}
               onClick={() => setType(id as CalendarEvent["type"])}
             >
-              <span className="block text-3xl">{item.emoji}</span>
+              <span className="block text-3xl">{id === "custom" ? "➕" : item.emoji}</span>
               <span className="mt-2 block text-sm">{item.label}</span>
             </button>
           ))}
         </div>
+        {type === "custom" && (
+          <div className="mb-4 rounded-2xl border border-blue-100 bg-blue-50 p-4">
+            <label className="grid gap-1">
+              <span className="text-sm font-black">איזה סוג אירוע?</span>
+              <input
+                className="rounded-2xl border border-slate-200 bg-white px-4 py-3"
+                value={customLabel}
+                maxLength={30}
+                onChange={(event) => setCustomLabel(event.target.value)}
+                placeholder="למשל: רופא שיניים, חוג שחייה, הופעה"
+              />
+            </label>
+            <span className="mt-3 block text-sm font-black">סמל לאירוע</span>
+            <div className="mt-1 flex flex-wrap gap-2">
+              {EVENT_EMOJI_CHOICES.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  className={cx(
+                    "grid h-11 w-11 place-items-center rounded-xl border text-2xl",
+                    customEmoji === emoji ? "border-blue-500 bg-white ring-2 ring-blue-300" : "border-slate-200 bg-white",
+                  )}
+                  onClick={() => setCustomEmoji(emoji)}
+                  aria-label={`סמל ${emoji}`}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="grid gap-3 lg:grid-cols-[1fr_220px_auto]">
           <input
             className="rounded-2xl border border-slate-200 px-4 py-3"
@@ -4906,7 +5524,7 @@ function EventsDashboard({
               onClick={() => {
                 const nextDate = new Date();
                 nextDate.setDate(nextDate.getDate() + Number(offset));
-                setDate(nextDate.toISOString().slice(0, 10));
+                setDate(localIsoDate(nextDate));
               }}
             >
               {label}
@@ -4915,25 +5533,44 @@ function EventsDashboard({
         </div>
       </div>
 
+      <label className="mb-3 flex items-center gap-2 font-bold">
+        <input
+          type="checkbox"
+          className="h-5 w-5"
+          checked={state.showHolidays !== false}
+          onChange={(event) => update((current) => ({ ...current, showHolidays: event.target.checked }))}
+        />
+        להציג בלוח חגים ומועדים (מתעדכן אוטומטית פעם ביום)
+      </label>
+      <EventsCalendar
+        events={[...state.events, ...holidayEvents]}
+        selectedDate={date}
+        onPickDate={setDate}
+        onDeleteEvent={deleteEvent}
+      />
+
+      <h2 className="mb-3 text-xl font-black">כל האירועים</h2>
+      {state.events.length === 0 && (
+        <p className="rounded-2xl border border-dashed border-slate-300 bg-white p-4 text-center font-bold text-muted">
+          עוד אין אירועים. הוסיפו אירוע למעלה.
+        </p>
+      )}
       <div className="space-y-3">
-        {state.events.map((event) => (
+        {[...state.events]
+          .sort((left, right) => left.date.localeCompare(right.date))
+          .map((event) => (
           <div key={event.id} className="flex items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4">
-            <span className="text-3xl">{eventLabels[event.type].emoji}</span>
+            <span className="text-3xl">{eventInfo(event).emoji}</span>
             <div className="flex-1">
               <div className="font-black">{event.title}</div>
               <div className="text-sm text-muted">
-                {eventLabels[event.type].label} · {event.date}
+                {eventInfo(event).label} · {event.date}
               </div>
             </div>
             <button
               type="button"
               className="rounded-2xl bg-red-50 px-4 py-2 font-black text-red-700"
-              onClick={() =>
-                update((current) => ({
-                  ...current,
-                  events: current.events.filter((item) => item.id !== event.id),
-                }))
-              }
+              onClick={() => deleteEvent(event.id)}
             >
               מחק
             </button>
@@ -4944,42 +5581,307 @@ function EventsDashboard({
   );
 }
 
+const TOPIC_EMOJI_CHOICES = ["⭐", "🌳", "🐶", "🚗", "🏖️", "❄️", "🕎", "🍎", "🎵", "⚽", "🧸", "🌈", "🦁", "🚌", "🩺", "🎉"];
+
 function TopicDashboard({
   state,
+  allSymbols,
   update,
 }: {
   state: DemoState;
+  allSymbols: AacSymbol[];
   update: (updater: (current: DemoState) => DemoState) => void;
 }) {
+  const [isCreating, setIsCreating] = useState(false);
+  const [label, setLabel] = useState("");
+  const [emoji, setEmoji] = useState(TOPIC_EMOJI_CHOICES[0] ?? "⭐");
+  const [pickedIds, setPickedIds] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [formError, setFormError] = useState("");
+
+  const customTopics = state.customTopics ?? [];
+  const symbolById = Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])) as Record<
+    string,
+    AacSymbol
+  >;
+  const query = search.trim();
+  const searchResults = allSymbols
+    .filter((symbol) => !query || symbol.label.includes(query))
+    .slice(0, 48);
+
+  const togglePicked = (symbolId: string): void =>
+    setPickedIds((current) =>
+      current.includes(symbolId) ? current.filter((id) => id !== symbolId) : [...current, symbolId],
+    );
+
+  const saveTopic = (): void => {
+    if (!label.trim()) {
+      setFormError("הזינ/י שם לנושא, למשל: חנוכה, חורף, בעלי חיים.");
+      return;
+    }
+    if (pickedIds.length === 0) {
+      setFormError("בחר/י לפחות סמל אחד שמתאים לנושא.");
+      return;
+    }
+    const topic: WeeklyTopic = {
+      id: `custom-topic-${Date.now()}`,
+      label: label.trim().slice(0, 30),
+      emoji,
+      symbolIds: pickedIds,
+    };
+    update((current) => ({
+      ...current,
+      customTopics: [...(current.customTopics ?? []), topic],
+      weeklyTopicId: topic.id,
+    }));
+    setIsCreating(false);
+    setLabel("");
+    setPickedIds([]);
+    setSearch("");
+    setFormError("");
+  };
+
+  const deleteTopic = (topicId: string): void => {
+    if (!window.confirm("למחוק את הנושא הזה?")) return;
+    update((current) => ({
+      ...current,
+      customTopics: (current.customTopics ?? []).filter((topic) => topic.id !== topicId),
+      weeklyTopicId: current.weeklyTopicId === topicId ? "feelings" : current.weeklyTopicId,
+    }));
+  };
+
+  const topicButton = (topic: WeeklyTopic, isCustom: boolean) => {
+    const isSelected = state.weeklyTopicId === topic.id;
+    return (
+      <div key={topic.id} className="relative">
+        <button
+          type="button"
+          className={cx(
+            "w-full rounded-soft border p-5 text-center font-black shadow-sm",
+            isSelected ? "border-blue-500 bg-blue-500 text-white" : "border-slate-200 bg-white text-slate-950",
+          )}
+          onClick={() => update((current) => ({ ...current, weeklyTopicId: topic.id }))}
+        >
+          <span className="block text-4xl">{topic.emoji}</span>
+          <span className={cx("mt-2 block", isSelected ? "text-white" : "text-slate-950")}>{topic.label}</span>
+          {isCustom && (
+            <span className={cx("mt-1 block text-xs", isSelected ? "text-blue-100" : "text-muted")}>
+              נושא שלי · {topic.symbolIds.length} סמלים
+            </span>
+          )}
+        </button>
+        {isCustom && (
+          <button
+            type="button"
+            className="absolute left-2 top-2 rounded-full bg-white/90 px-2 text-sm font-black text-red-700 shadow-sm"
+            onClick={() => deleteTopic(topic.id)}
+            aria-label={`מחק את הנושא ${topic.label}`}
+          >
+            ×
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <section>
       <h1 className="text-3xl font-black">נושא שבועי</h1>
-      <p className="mb-6 text-muted">הנושא משפיע בעדינות על ההצעות במסך הילד.</p>
+      <p className="mb-6 text-muted">
+        הנושא מוסיף לילד סמלים ומשפטים מתאימים. אפשר לבחור נושא מוכן או ליצור נושא משלכם.
+      </p>
       <div className="grid gap-4 md:grid-cols-4">
-        {weeklyTopics.map((topic) => {
-          const isSelected = state.weeklyTopicId === topic.id;
+        {weeklyTopics.map((topic) => topicButton(topic, false))}
+        {customTopics.map((topic) => topicButton(topic, true))}
+        <button
+          type="button"
+          className="rounded-soft border-2 border-dashed border-blue-300 bg-blue-50/60 p-5 text-center font-black text-blue-800"
+          onClick={() => setIsCreating(true)}
+        >
+          <span className="block text-4xl">➕</span>
+          <span className="mt-2 block">נושא משלי</span>
+        </button>
+      </div>
 
-          return (
+      {isCreating && (
+        <div className="mt-6 rounded-soft border border-blue-200 bg-white p-5 shadow-sm">
+          <h2 className="text-xl font-black">נושא חדש</h2>
+          <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
+            <label className="grid gap-1">
+              <span className="text-sm font-black">שם הנושא</span>
+              <input
+                className="rounded-2xl border border-slate-200 px-4 py-3"
+                value={label}
+                maxLength={30}
+                onChange={(event) => setLabel(event.target.value)}
+                placeholder="למשל: חנוכה, חורף, בעלי חיים"
+              />
+            </label>
+          </div>
+          <span className="mt-4 block text-sm font-black">סמל לנושא</span>
+          <div className="mt-1 flex flex-wrap gap-2">
+            {TOPIC_EMOJI_CHOICES.map((choice) => (
+              <button
+                key={choice}
+                type="button"
+                className={cx(
+                  "grid h-11 w-11 place-items-center rounded-xl border text-2xl",
+                  emoji === choice ? "border-blue-500 ring-2 ring-blue-300" : "border-slate-200",
+                )}
+                onClick={() => setEmoji(choice)}
+                aria-label={`סמל ${choice}`}
+              >
+                {choice}
+              </button>
+            ))}
+          </div>
+
+          <span className="mt-4 block text-sm font-black">
+            הסמלים שיופיעו לילד בנושא ({pickedIds.length} נבחרו)
+          </span>
+          {pickedIds.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {pickedIds.map((symbolId) => (
+                <button
+                  key={`picked-${symbolId}`}
+                  type="button"
+                  className="rounded-full bg-blue-100 px-3 py-1 text-sm font-black text-blue-900"
+                  onClick={() => togglePicked(symbolId)}
+                  title="הסרה"
+                >
+                  {symbolById[symbolId]?.emoji} {symbolById[symbolId]?.label ?? symbolId} ×
+                </button>
+              ))}
+            </div>
+          )}
+          <input
+            className="mt-3 w-full rounded-2xl border border-slate-200 px-4 py-2"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="🔍 חיפוש סמל: כדור, שמח, אמא..."
+          />
+          <div className="mt-3 grid max-h-72 grid-cols-3 gap-2 overflow-y-auto sm:grid-cols-6 lg:grid-cols-8">
+            {searchResults.map((symbol) => {
+              const isPicked = pickedIds.includes(symbol.id);
+              return (
+                <button
+                  key={symbol.id}
+                  type="button"
+                  className={cx(
+                    "flex flex-col items-center rounded-xl border p-2 text-center",
+                    isPicked ? "border-blue-500 bg-blue-50 ring-2 ring-blue-300" : "border-slate-200 bg-white",
+                  )}
+                  onClick={() => togglePicked(symbol.id)}
+                >
+                  {symbol.pictogramId ? (
+                    <img
+                      src={arasaacImageUrl(symbol.pictogramId)}
+                      alt={symbol.label}
+                      className="h-10 w-10 object-contain"
+                    />
+                  ) : (
+                    <span className="text-3xl leading-10">{symbol.emoji}</span>
+                  )}
+                  <span className="mt-1 w-full truncate text-xs font-bold">{symbol.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {formError && (
+            <p className="mt-3 rounded-2xl bg-red-100 px-4 py-2 text-sm font-black text-red-800">{formError}</p>
+          )}
+          <div className="mt-4 flex gap-2">
+            <button
+              type="button"
+              className="rounded-2xl bg-blue-600 px-5 py-3 font-black text-white"
+              onClick={saveTopic}
+            >
+              שמירה ובחירה כנושא השבוע
+            </button>
+            <button
+              type="button"
+              className="rounded-2xl border border-slate-200 px-5 py-3 font-black"
+              onClick={() => {
+                setIsCreating(false);
+                setFormError("");
+              }}
+            >
+              ביטול
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// "🔊 הקול": listen to the Hebrew voices on this device and pick the most
+// pleasant one. Saved on the device (voices differ between devices).
+function VoicePicker({ speechRate }: { speechRate: number }) {
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [chosen, setChosen] = useState("");
+
+  useEffect(() => {
+    setChosen(readChosenVoice());
+    const load = (): void => setVoices(hebrewVoicesOnDevice());
+    load();
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.addEventListener("voiceschanged", load);
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
+  }, []);
+
+  const choose = (name: string): void => {
+    setChosen(name);
+    try {
+      if (name) window.localStorage.setItem(VOICE_KEY, name);
+      else window.localStorage.removeItem(VOICE_KEY);
+    } catch {
+      // not saved — still used for this sample
+    }
+    speakHebrew("שלום! אני רוצה לשחק עם אמא.", speechRate);
+  };
+
+  // "Microsoft הילה Online (Natural) - Hebrew (Israel)" → "הילה · טבעי"
+  const friendlyName = (voice: SpeechSynthesisVoice): string => {
+    const name = voice.name.replace(/microsoft|google|online|\(natural\)|- hebrew \(israel\)|hebrew|\(israel\)/gi, "").trim();
+    const natural = /natural/i.test(voice.name) ? " · טבעי וברור" : /google/i.test(voice.name) ? " · Google" : "";
+    return `${name || voice.name}${natural}`;
+  };
+
+  return (
+    <div className="mb-8 rounded-soft border border-sky-200 bg-sky-50 p-5 shadow-sm">
+      <h2 className="text-2xl font-black">🔊 הקול</h2>
+      <p className="mt-1 text-muted">לחצו על קול כדי לשמוע אותו ולבחור. הבחירה נשמרת במכשיר הזה.</p>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <button
+          type="button"
+          className={cx(
+            "rounded-2xl border px-4 py-2 font-black",
+            chosen === "" ? "border-sky-600 bg-sky-600 text-white" : "border-sky-200 bg-white text-sky-950",
+          )}
+          onClick={() => choose("")}
+        >
+          ▶ אוטומטי (הקול הכי ברור)
+        </button>
+        {voices.map((voice) => (
           <button
-            key={topic.id}
+            key={voice.name}
             type="button"
             className={cx(
-              "rounded-soft border p-5 text-center font-black shadow-sm",
-              isSelected
-                ? "border-blue-500 bg-blue-500 text-white"
-                : "border-slate-200 bg-white text-slate-950",
+              "rounded-2xl border px-4 py-2 font-black",
+              chosen === voice.name ? "border-sky-600 bg-sky-600 text-white" : "border-sky-200 bg-white text-sky-950",
             )}
-            onClick={() => update((current) => ({ ...current, weeklyTopicId: topic.id }))}
+            onClick={() => choose(voice.name)}
           >
-            <span className="block text-4xl">{topic.emoji}</span>
-            <span className={cx("mt-2 block", isSelected ? "text-white" : "text-slate-950")}>
-              {topic.label}
-            </span>
+            ▶ {friendlyName(voice)}
           </button>
-          );
-        })}
+        ))}
       </div>
-    </section>
+      {voices.length === 0 && (
+        <p className="mt-3 text-sm text-muted">לא נמצאו קולות בעברית בדפדפן הזה. מומלץ להשתמש ב-Edge.</p>
+      )}
+    </div>
   );
 }
 
@@ -4998,47 +5900,7 @@ function LevelDashboard({
 
   return (
     <section>
-      <div className="mb-8 rounded-soft border border-violet-200 bg-violet-50 p-5 shadow-sm">
-        <h2 className="text-2xl font-black">✨ מתקן העברית</h2>
-        <p className="mt-1 text-muted">
-          הסמלים הם מילים בודדות ("אני רוצה מים קר"). המתקן הופך אותן למשפט תקין וטבעי ("אני רוצה
-          מים קרים") ומקריא אותו בלשון המתאימה לילד/ה.
-        </p>
-        <div className="mt-4 flex flex-wrap items-center gap-3">
-          <span className="font-black">הילד/ה:</span>
-          {(
-            [
-              ["boy", "👦 בן (אני עייף)"],
-              ["girl", "👧 בת (אני עייפה)"],
-            ] as const
-          ).map(([gender, label]) => (
-            <button
-              key={gender}
-              type="button"
-              className={cx(
-                "rounded-2xl border px-4 py-2 font-black",
-                (state.childGender ?? "boy") === gender
-                  ? "border-violet-600 bg-violet-600 text-white"
-                  : "border-violet-200 bg-white text-violet-950",
-              )}
-              onClick={() => update((current) => ({ ...current, childGender: gender }))}
-            >
-              {label}
-            </button>
-          ))}
-          <label className="mr-auto flex items-center gap-2 font-black">
-            <input
-              type="checkbox"
-              className="h-5 w-5"
-              checked={state.smartGrammar !== false}
-              onChange={(event) =>
-                update((current) => ({ ...current, smartGrammar: event.target.checked }))
-              }
-            />
-            תיקון משפטים חכם (AI)
-          </label>
-        </div>
-      </div>
+      <VoicePicker speechRate={state.speechRate} />
 
       <h1 className="text-3xl font-black">רמת תפקוד</h1>
       <p className="mb-6 text-muted">הרמה נשלטת ידנית על ידי מטפל או הורה.</p>
@@ -5924,7 +6786,7 @@ function ProgressDashboard({
         <Metric label="שימוש יומי" value={String(state.sentenceCount)} />
         <Metric label="אורך משפט ממוצע" value={averageLength} />
         <Metric label="שימושים בסמלים" value={String(symbolUses)} />
-        <Metric label="שימוש בנושא השבוע" value={String(activeTopicUsage)} />
+        <Metric label="סמלים מנושא השבוע שנלחצו" value={String(activeTopicUsage)} />
       </div>
 
       <div className="mt-6 grid gap-5 xl:grid-cols-2">
@@ -5982,9 +6844,107 @@ function ProgressDashboard({
         <div className="text-sm font-black text-muted">מגמת שיפור</div>
         <div className="mt-2 text-2xl font-black text-emerald-700">📈 {trend}</div>
         <p className="mt-2 text-muted">
-          המגמה מבוססת על מספר משפטים ושימושים בסמלים, בלי אבחון רפואי.
+          המגמה מבוססת על מספר משפטים ושימושים בסמלים.
         </p>
       </div>
+
+      <StoryProgress results={state.storyResults ?? []} />
     </section>
+  );
+}
+
+// "📖 משחק הסיפור" on the progress page: per day the child played — how many
+// stories, how many words they matched to the sentence on the first try out
+// of all the words, and the success rate.
+function StoryProgress({ results }: { results: StoryResult[] }) {
+  const summarize = (items: StoryResult[]) => {
+    const words = items.reduce((total, item) => total + item.steps, 0);
+    const matched = items.reduce((total, item) => total + item.firstTry, 0);
+    return {
+      stories: items.length,
+      finished: items.filter((item) => !item.partial).length,
+      words,
+      matched,
+      percent: words ? Math.round((matched / words) * 100) : 0,
+    };
+  };
+
+  const byDay = Object.entries(
+    results.reduce<Record<string, StoryResult[]>>((days, item) => {
+      days[item.date] = [...(days[item.date] ?? []), item];
+      return days;
+    }, {}),
+  )
+    .sort(([left], [right]) => right.localeCompare(left))
+    .map(([date, items]) => ({ date, ...summarize(items) }));
+
+  const todayRow = byDay.find((row) => row.date === today());
+  const formatDate = (date: string): string => date.split("-").reverse().join("/");
+
+  return (
+    <div className="mt-5 rounded-soft border border-rose-200 bg-white p-5 shadow-sm">
+      <h2 className="text-xl font-black">📖 משחק הסיפור — התאמת מילה למשפט</h2>
+      {results.length === 0 ? (
+        <p className="mt-2 text-muted">עוד לא שוחק סיפור. התוצאות יופיעו כאן אחרי הסיפור הראשון.</p>
+      ) : (
+        <>
+          <h3 className="mt-4 mb-2 font-black">היום</h3>
+          {todayRow ? (
+            <div className="grid gap-4 md:grid-cols-3">
+              <Metric label="סיפורים היום" value={String(todayRow.stories)} />
+              <Metric label="מילים שהותאמו היום" value={`${todayRow.matched} מתוך ${todayRow.words}`} />
+              <Metric label="הצלחה היום" value={`${todayRow.percent}%`} />
+            </div>
+          ) : (
+            <p className="rounded-2xl bg-slate-50 p-3 text-muted">היום עוד לא שוחק סיפור.</p>
+          )}
+
+          <h3 className="mt-5 mb-2 font-black">לפי ימים</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-right">
+              <thead>
+                <tr className="text-sm text-muted">
+                  <th className="p-2 font-black">תאריך</th>
+                  <th className="p-2 font-black">סיפורים</th>
+                  <th className="p-2 font-black">מילים שהותאמו</th>
+                  <th className="p-2 font-black">הצלחה</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byDay.slice(0, 14).map((row) => (
+                  <tr key={row.date} className="border-t border-slate-100">
+                    <td className="p-2 font-black">{formatDate(row.date)}</td>
+                    <td className="p-2">
+                      {row.stories}
+                      {row.finished < row.stories && (
+                        <span className="text-sm text-muted"> ({row.stories - row.finished} לא הושלמו)</span>
+                      )}
+                    </td>
+                    <td className="p-2">
+                      {row.matched} מתוך {row.words}
+                    </td>
+                    <td className="p-2">
+                      <span
+                        className={cx(
+                          "rounded-full px-3 py-1 text-sm font-black",
+                          row.percent >= 80
+                            ? "bg-emerald-100 text-emerald-800"
+                            : row.percent >= 50
+                              ? "bg-amber-100 text-amber-900"
+                              : "bg-rose-100 text-rose-800",
+                        )}
+                      >
+                        {row.percent}%
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+        </>
+      )}
+    </div>
   );
 }

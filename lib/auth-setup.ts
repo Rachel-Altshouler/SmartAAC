@@ -35,6 +35,9 @@ export type AuthSuccessPayload = {
   teacherEmail?: string;
   isFirstLogin?: boolean;
   linkedChildren?: Array<{ id: string; name: string }>;
+  // What the login really was: someone already on a child's care team who
+  // pressed "יצירת פרופיל חדש" is logged in to that child, not given a new one.
+  accountType?: AccountType;
 };
 
 const createTeacherInviteCode = (): string =>
@@ -80,15 +83,33 @@ const storeChildAccessCode = async (
     }
   }
 
-  const inserted = await writer.from("child_access_codes").insert({
-    child_id: childId,
-    code_hash: hashAccessCode(rawCode),
-    created_by: userId,
-  });
+  const row = { child_id: childId, code_hash: hashAccessCode(rawCode), created_by: userId };
+  let inserted = await writer.from("child_access_codes").insert({ ...row, code_plain: rawCode.trim() });
+  if (inserted.error && /code_plain|schema cache/i.test(inserted.error.message)) {
+    // before migration 006: store the hash only
+    inserted = await writer.from("child_access_codes").insert(row);
+  }
 
   if (inserted.error) {
     throw new Error(inserted.error.message);
   }
+};
+
+// The child's current code, so everyone on the care team sees the same one
+// and can pass it on. null before migration 006 or when none is stored.
+export const readActiveChildCode = async (childId: string): Promise<string | null> => {
+  const admin = createAdminSupabaseClient();
+  if (!admin) return null;
+  const result = await admin
+    .from("child_access_codes")
+    .select("code_plain")
+    .eq("child_id", childId)
+    .eq("is_active", true)
+    .not("code_plain", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return result.error ? null : ((result.data?.code_plain as string | undefined) ?? null);
 };
 
 const getLinkedChildren = async (
@@ -128,6 +149,24 @@ const getLinkedChildren = async (
   }
 
   return legacy.data.map((child) => ({ id: child.id, name: child.display_name }));
+};
+
+// A child this account already works with: the one this device last used if
+// the account can still open it, else one it joined with a code, else its own.
+const findExistingChild = async (
+  client: ReturnType<typeof createAuthedSupabaseClient>,
+  userId: string,
+  knownChildId: string | undefined,
+): Promise<ChildRow | null> => {
+  const own = await client
+    .from("children")
+    .select("id, display_name")
+    .eq("parent_id", userId)
+    .order("created_at", { ascending: true });
+  const ownChildren = (own.data ?? []) as ChildRow[];
+  const linked = (await getLinkedChildren(userId)).map((child) => ({ id: child.id, display_name: child.name }));
+  const all = [...linked, ...ownChildren];
+  return all.find((child) => child.id === knownChildId) ?? linked[0] ?? ownChildren[0] ?? null;
 };
 
 const joinChildByCode = async (
@@ -409,6 +448,11 @@ export const rotateTeacherAccessCode = async (input: {
     throw new Error("לא נמצא פרופיל ילד להורה.");
   }
 
+  const access = await client.rpc("can_access_child", { child_uuid: childId });
+  if (access.error || access.data !== true) {
+    throw new Error("אין הרשאה ליצור קוד לילד הזה.");
+  }
+
   const code = createTeacherInviteCode();
   await storeChildAccessCode(client, childId, code, userId);
   return code;
@@ -423,6 +467,8 @@ export const completeAuthSetup = async (input: {
   childName?: string;
   childAccessCode?: string;
   knownInviteCode?: string;
+  // The child this device last worked on — preferred when no code is given.
+  knownChildId?: string;
   teacherEmail?: string;
   functionalityLevel?: string;
   appOrigin?: string;
@@ -433,12 +479,18 @@ export const completeAuthSetup = async (input: {
   await ensureUserProfile(client, userId, input.name, input.mode);
 
   if (input.accountType === "join") {
-    const activeChild = await joinChildByCode(
-      input.childAccessCode ?? "",
-      input.name,
-      userId,
-      input.mode,
-    );
+    // Returning login: no code needed. Open a child this account already
+    // works with — one it created, or one it joined with a code before.
+    let activeChild: ChildRow;
+    if (input.childAccessCode?.trim()) {
+      activeChild = await joinChildByCode(input.childAccessCode, input.name, userId, input.mode);
+    } else {
+      const known = await findExistingChild(client, userId, input.knownChildId);
+      if (!known) {
+        throw new Error("צריך להזין קוד ילד כדי שהמערכת תדע על איזה ילד לעבוד.");
+      }
+      activeChild = known;
+    }
     const linkedChildren = await getLinkedChildren(userId);
     const allLinkedChildren = linkedChildren.some((child) => child.id === activeChild.id)
       ? linkedChildren
@@ -457,10 +509,39 @@ export const completeAuthSetup = async (input: {
       childId: activeChild.id,
       childName: activeChild.display_name,
       linkedChildren: allLinkedChildren,
+      accountType: "join",
+      teacherInviteCode:
+        input.childAccessCode?.trim() || (await readActiveChildCode(activeChild.id)) || undefined,
     };
   }
 
   const isFirstLogin = !(await parentHasChild(client, userId));
+
+  // Already on another child's care team (joined with a code before) and no
+  // child of their own: this is a returning login on the wrong tab — open
+  // that child instead of quietly creating a new, empty "דניאל".
+  if (isFirstLogin && !input.childAccessCode?.trim()) {
+    const linked = await getLinkedChildren(userId);
+    if (linked.length > 0) {
+      const preferred = linked.find((child) => child.id === input.knownChildId) ?? linked[0];
+      return {
+        session: {
+          access_token: input.session.access_token,
+          refresh_token: input.session.refresh_token,
+        },
+        userId,
+        email: input.email,
+        name: input.name,
+        mode: input.mode,
+        savedInSupabase: true,
+        childId: preferred?.id,
+        childName: preferred?.name,
+        linkedChildren: linked,
+        accountType: "join",
+        teacherInviteCode: preferred ? (await readActiveChildCode(preferred.id)) ?? undefined : undefined,
+      };
+    }
+  }
   const childRow = await getOrCreateParentChild(
     client,
     userId,

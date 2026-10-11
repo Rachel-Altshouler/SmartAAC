@@ -14,6 +14,7 @@ type AuthRequest = {
   childName?: string;
   childAccessCode?: string;
   knownInviteCode?: string;
+  knownChildId?: string;
   teacherEmail?: string;
   functionalityLevel?: string;
 };
@@ -70,6 +71,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       childName: body.childName,
       childAccessCode: body.childAccessCode,
       knownInviteCode: body.knownInviteCode,
+      knownChildId: body.knownChildId,
       teacherEmail: body.teacherEmail,
       functionalityLevel: body.functionalityLevel,
       appOrigin: request.headers.get("origin") ?? undefined,

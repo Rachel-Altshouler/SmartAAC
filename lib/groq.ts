@@ -19,6 +19,7 @@ type GroqChatResponse = {
 
 type GroqWhisperResponse = {
   text?: string;
+  segments?: Array<{ text?: string; no_speech_prob?: number; avg_logprob?: number }>;
   error?: {
     message?: string;
   };
@@ -116,7 +117,9 @@ export async function groqTranscribeAudio(
   form.append("language", "he");
   form.append("prompt", WHISPER_HEbrew_PROMPT);
   form.append("temperature", "0");
-  form.append("response_format", "json");
+  // verbose_json carries a no-speech probability per segment: on a silent or
+  // near-silent recording Whisper otherwise "hears" a stock phrase ("תודה.").
+  form.append("response_format", "verbose_json");
 
   const response = await fetch(`${GROQ_BASE_URL}/audio/transcriptions`, {
     method: "POST",
@@ -138,7 +141,14 @@ export async function groqTranscribeAudio(
     return { ok: false, error: data.error?.message ?? "groq transcription failed" };
   }
 
-  const text = data.text?.trim() ?? "";
+  const text = data.segments
+    ? data.segments
+        .filter((segment) => (segment.no_speech_prob ?? 0) < 0.6 && (segment.avg_logprob ?? 0) > -1)
+        .map((segment) => segment.text?.trim() ?? "")
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+    : (data.text?.trim() ?? "");
   if (!text) {
     return { ok: false, error: "empty transcript" };
   }

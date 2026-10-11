@@ -36,6 +36,8 @@ type CallbackRequest = {
 
   knownInviteCode?: string;
 
+  knownChildId?: string;
+
   teacherEmail?: string;
 
   functionalityLevel?: string;
@@ -179,6 +181,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       childAccessCode: body.childAccessCode,
 
       knownInviteCode: body.knownInviteCode,
+
+      knownChildId: body.knownChildId,
 
       teacherEmail: body.teacherEmail,
 

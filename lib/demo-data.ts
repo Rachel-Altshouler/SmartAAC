@@ -39,9 +39,12 @@ export const arasaacImageUrl = (pictogramId: number): string =>
 
 export type CalendarEvent = {
   id: string;
-  type: "trip" | "birthday" | "school" | "family" | "special";
+  type: "trip" | "birthday" | "school" | "family" | "special" | "custom";
   title: string;
   date: string;
+  // Only for type "custom": an event type that isn't in the fixed list.
+  customLabel?: string;
+  customEmoji?: string;
 };
 
 export type WeeklyTopic = {
@@ -65,6 +68,8 @@ export type DemoState = {
   // words are turned into a corrected sentence before being read aloud.
   childGender?: "boy" | "girl";
   smartGrammar?: boolean;
+  // Weekly topics the parent/teacher made up, next to the built-in ones.
+  customTopics?: WeeklyTopic[];
   isRegisteredInSupabase: boolean;
   supabaseUserId?: string;
   supabaseChildId?: string;
@@ -85,9 +90,27 @@ export type DemoState = {
   usageBySymbolId: Record<string, number>;
   sentenceCount: number;
   sentenceLengths: number[];
+  // Story game: each finished story, newest last (kept to the last 50).
+  storyResults?: StoryResult[];
+  // Progress recorded on the child's other devices (shown added to this one's).
+  otherUsage?: import("@/lib/usage-stats").UsageStats;
+  // Pictures found for typed words that aren't on the board (word → ARASAAC id, 0 = none).
+  typedPictograms?: Record<string, number>;
+  // Israeli holidays and national days shown in the calendar (default on).
+  showHolidays?: boolean;
   categoryUsageById: Record<string, number>;
   topicUsageById: Record<string, number>;
   events: CalendarEvent[];
+};
+
+export type StoryResult = {
+  date: string; // YYYY-MM-DD
+  title: string;
+  steps: number;
+  firstTry: number; // steps the right word was picked on the first tap
+  wrongTaps: number;
+  // true when the child left before the end: steps = the words they got to
+  partial?: boolean;
 };
 
 export type QuickPhrase = {
@@ -352,12 +375,6 @@ export const buildAllEmojiChoices = (): string[] => {
 
 export const allEmojiChoices = buildAllEmojiChoices();
 
-const isoDateFromToday = (offset: number): string => {
-  const date = new Date();
-  date.setDate(date.getDate() + offset);
-  return date.toISOString().slice(0, 10);
-};
-
 export const initialState: DemoState = {
   parentName: "",
   parentEmail: "",
@@ -402,10 +419,9 @@ export const initialState: DemoState = {
   sentenceLengths: [],
   categoryUsageById: {},
   topicUsageById: {},
-  events: [
-    { id: "1", type: "trip", title: "טיול לגן החיות", date: isoDateFromToday(1) },
-    { id: "2", type: "birthday", title: "יום הולדת לסבתא", date: isoDateFromToday(-1) },
-  ],
+  // Events belong to one child and live in Supabase — no demo events here,
+  // or they'd be uploaded into every new child's profile.
+  events: [],
 };
 
 export const getAllCategories = (state: Pick<DemoState, "customCategories">): SymbolCategory[] => [

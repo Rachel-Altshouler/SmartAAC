@@ -70,6 +70,7 @@ const eventSignals: Record<DemoState["events"][number]["type"], string[]> = {
   school: ["class", "book"],
   family: ["mom", "dad", "love"],
   special: ["happy", "more"],
+  custom: ["happy", "more"],
 };
 
 export type SentenceSuggestion = { text: string; emoji: string };
@@ -80,6 +81,7 @@ const eventEmoji: Record<CalendarEvent["type"], string> = {
   school: "🏫",
   family: "👪",
   special: "✨",
+  custom: "📌",
 };
 
 const WEEKLY_TOPIC_SENTENCES: Record<string, SentenceSuggestion[]> = {
@@ -129,7 +131,7 @@ export const buildFallbackSentenceSuggestions = (state: DemoState): SentenceSugg
           : distance === 0
             ? `היום: ${event.title}`
             : `איך היה ב${event.title}?`;
-      return { text, emoji: eventEmoji[event.type] };
+      return { text, emoji: event.customEmoji || eventEmoji[event.type] };
     });
 
 export const buildContextSuggestions = (state: DemoState): ContextSuggestion[] => {
@@ -152,7 +154,9 @@ export const buildContextSuggestions = (state: DemoState): ContextSuggestion[] =
   const time = getTimeSignals();
   time.symbolIds.forEach((symbolId) => addScore(symbolId, 5, time.label));
 
-  const topic = weeklyTopics.find((item) => item.id === state.weeklyTopicId);
+  const topic = [...weeklyTopics, ...(state.customTopics ?? [])].find(
+    (item) => item.id === state.weeklyTopicId,
+  );
   topic?.symbolIds.forEach((symbolId) => addScore(symbolId, 4, "נושא השבוע"));
 
   state.events.forEach((event) => {
