@@ -136,6 +136,7 @@ export default function AuthCallbackPage() {
           email: googleEmail,
           childName: draft.childName,
           childAccessCode: draft.childAccessCode,
+          mustBeMember: (draft as { mustBeMember?: boolean }).mustBeMember === true,
           functionalityLevel: draft.functionalityLevel,
         }),
       });
@@ -199,6 +200,14 @@ export default function AuthCallbackPage() {
     <main className="grid min-h-screen place-items-center bg-slate-50 p-6 text-center">
       <div className="rounded-3xl bg-white p-8 shadow-lg">
         <p className="text-xl font-bold text-slate-800">{message}</p>
+        {message !== "מסיימים התחברות..." && (
+          <a
+            href="/"
+            className="mt-5 inline-flex rounded-full bg-blue-600 px-6 py-3 font-bold text-white"
+          >
+            חזרה לדף הבית
+          </a>
+        )}
       </div>
     </main>
   );

@@ -38,6 +38,8 @@ type CallbackRequest = {
 
   knownChildId?: string;
 
+  mustBeMember?: boolean;
+
   teacherEmail?: string;
 
   functionalityLevel?: string;
@@ -189,6 +191,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       functionalityLevel: body.functionalityLevel,
 
       appOrigin: request.headers.get("origin") ?? undefined,
+
+      mustBeMember: body.mustBeMember === true,
 
     });
 

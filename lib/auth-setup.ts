@@ -56,6 +56,8 @@ const normalizeAccessCode = (rawCode: string): string => {
 const hashAccessCode = (rawCode: string): string =>
   createHash("md5").update(normalizeAccessCode(rawCode)).digest("hex");
 
+export const NOT_REGISTERED_MESSAGE = 'עוד לא נרשמת למערכת עם הקוד הזה. נא להירשם קודם — בלשונית "הרשמה". אם כבר נרשמת, בדקו את הסיסמה.';
+
 const WRONG_CODE_MESSAGE = 'קוד הילד/ה לא נכון. בדקו אותו — הקוד מופיע בלוח הבקרה, במסך "סקירה".';
 
 const isMissingDbFunction = (message: string): boolean => {
@@ -556,7 +558,7 @@ export const loginWithChildCode = async (input: {
   if (codes.error) throw new Error(codes.error.message);
   const codeHash = hashAccessCode(input.code.trim());
   const match = codes.data?.find((row) => row.code_hash === codeHash);
-  if (!match) throw new Error("WRONG_CODE_OR_PASSWORD");
+  if (!match) throw new Error(WRONG_CODE_MESSAGE);
 
   // The child's care team: whoever created it and everyone who joined.
   const [child, caregivers] = await Promise.all([
@@ -589,7 +591,7 @@ export const loginWithChildCode = async (input: {
     });
     return { ...payload, mode };
   }
-  throw new Error("WRONG_CODE_OR_PASSWORD");
+  throw new Error(NOT_REGISTERED_MESSAGE);
 };
 
 export const completeAuthSetup = async (input: {
@@ -606,9 +608,25 @@ export const completeAuthSetup = async (input: {
   teacherEmail?: string;
   functionalityLevel?: string;
   appOrigin?: string;
+  // "כניסה" (not "הרשמה"): refuse someone who isn't on the child's team yet.
+  mustBeMember?: boolean;
 }): Promise<AuthSuccessPayload> => {
   const client = createAuthedSupabaseClient(input.session.access_token);
   const userId = input.session.user.id;
+
+  if (input.mustBeMember) {
+    const admin = createAdminSupabaseClient();
+    const codes = admin
+      ? await admin.from("child_access_codes").select("child_id, code_hash").eq("is_active", true)
+      : null;
+    const childId = codes?.data?.find((row) => row.code_hash === hashAccessCode(input.childAccessCode ?? ""))?.child_id;
+    if (!admin || !childId) throw new Error(WRONG_CODE_MESSAGE);
+    const [owner, link] = await Promise.all([
+      admin.from("children").select("id").eq("id", childId).eq("parent_id", userId).maybeSingle(),
+      admin.from("child_caregivers").select("child_id").eq("child_id", childId).eq("caregiver_id", userId).maybeSingle(),
+    ]);
+    if (!owner.data && !link.data) throw new Error(NOT_REGISTERED_MESSAGE);
+  }
 
   // Signing in to a child (not creating one): an account that already exists
   // keeps the role and name it registered with — the "כניסה" screen (code +

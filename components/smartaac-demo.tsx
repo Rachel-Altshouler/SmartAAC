@@ -149,6 +149,8 @@ type AccountType = "create" | "join";
 type AuthDraft = {
   mode: "parent" | "teacher";
   accountType: AccountType;
+  // started from "כניסה": only for someone already on the child's team
+  mustBeMember?: boolean;
   name: string;
   email: string;
   childName: string;
@@ -284,6 +286,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
       email: googleEmail,
       childName: draft.childName,
       childAccessCode: draft.childAccessCode,
+      mustBeMember: draft.mustBeMember === true,
       knownInviteCode: readKnownInviteCode(),
       knownChildId: readKnownChildId(),
       functionalityLevel: draft.functionalityLevel,
@@ -1216,6 +1219,7 @@ export function SmartAACDemo() {
   // changed on this device (null until this child's data was loaded).
   const syncedImagesRef = useRef<Record<string, string> | null>(null);
   const latestStateRef = useRef<DemoState>(initialState);
+  const skipRememberedFieldsRef = useRef(false);
   latestStateRef.current = state;
   const skipUsageStatsSyncRef = useRef(false);
 
@@ -1227,9 +1231,16 @@ export function SmartAACDemo() {
       // An invite link always means "join with this code" — the invitee
       // still picks their own role (parent/teacher) label in the form.
       setAuthAccountType("join");
+      setAuthScreen("register");
       if (mode === "parent" || mode === "teacher") {
         setAuthMode(mode);
       }
+      // the details of whoever used this browser before (e.g. the inviting
+      // parent) must not be filled in for the invited teacher
+      setParentEmail("");
+      setParentName("");
+      setPassword("");
+      skipRememberedFieldsRef.current = true;
       setIsLoginOpen(true);
       setChildAccessCode(code);
       window.history.replaceState({}, "", "/");
@@ -1301,12 +1312,14 @@ export function SmartAACDemo() {
         name?: string;
         rememberMe?: boolean;
       };
-      if (remembered.rememberMe !== false && remembered.email) {
-        setParentEmail(remembered.email);
-        setRememberMe(true);
-      }
-      if (remembered.name) {
-        setParentName(remembered.name);
+      if (!skipRememberedFieldsRef.current) {
+        if (remembered.rememberMe !== false && remembered.email) {
+          setParentEmail(remembered.email);
+          setRememberMe(true);
+        }
+        if (remembered.name) {
+          setParentName(remembered.name);
+        }
       }
     }
   }, []);
@@ -2375,6 +2388,7 @@ export function SmartAACDemo() {
       const draft: AuthDraft = {
         mode: authMode,
         accountType: googleAccountType,
+        mustBeMember: authScreen === "login",
         name: parentName.trim() || (authMode === "parent" ? "הורה" : "מורה"),
         email: parentEmail.trim(),
         childName: childName.trim() || "דניאל",
@@ -3184,6 +3198,15 @@ function LoginModal({
             )}
             {authMessage && (
               <p className="mt-3 rounded-2xl bg-amber-50 p-3 text-sm font-bold text-amber-900">{authMessage}</p>
+            )}
+            {authMessage.includes("להירשם") && (
+              <button
+                type="button"
+                className="mt-2 w-full rounded-2xl bg-emerald-600 px-5 py-3 font-bold text-white"
+                onClick={() => onAuthScreenChange("register")}
+              >
+                להרשמה למערכת
+              </button>
             )}
             <button
               type="button"

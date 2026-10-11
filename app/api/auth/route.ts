@@ -42,8 +42,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       return NextResponse.json(await loginWithChildCode({ code, password: body.password }));
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      return message === "WRONG_CODE_OR_PASSWORD" || message.startsWith("קוד הילד/ה לא נכון")
-        ? NextResponse.json({ error: "הקוד או הסיסמה לא נכונים." }, { status: 401 })
+      return message.startsWith("קוד הילד/ה לא נכון") || message.startsWith("עוד לא נרשמת")
+        ? NextResponse.json({ error: message }, { status: 401 })
         : NextResponse.json({ error: message || "אירעה שגיאה. נסו שוב." }, { status: 500 });
     }
   }
