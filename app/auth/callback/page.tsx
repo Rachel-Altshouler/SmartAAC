@@ -152,6 +152,8 @@ export default function AuthCallbackPage() {
         childName?: string;
         linkedChildren?: Array<{ id: string; name: string }>;
         savedInSupabase?: boolean;
+        mode?: "parent" | "teacher";
+        accountType?: "create" | "join";
       };
 
       if (!response.ok) {
@@ -180,8 +182,8 @@ export default function AuthCallbackPage() {
           childId: payload.childId,
           childName: payload.childName,
           linkedChildren: payload.linkedChildren,
-          mode: draft.mode,
-          accountType: draft.accountType,
+          mode: payload.mode ?? draft.mode,
+          accountType: payload.accountType ?? draft.accountType,
         }),
       );
 

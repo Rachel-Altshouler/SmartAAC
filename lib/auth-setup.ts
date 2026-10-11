@@ -1,8 +1,10 @@
 import { createHash } from "crypto";
+import { sendEmail } from "@/lib/email";
 import {
   createAdminSupabaseClient,
   createAuthedSupabaseClient,
   ensureUserProfileWithAdmin,
+  signInWithPassword,
   type SupabaseAuthSession,
 } from "@/lib/supabase-server";
 
@@ -151,6 +153,24 @@ const getLinkedChildren = async (
   return legacy.data.map((child) => ({ id: child.id, name: child.display_name }));
 };
 
+// Every child this account works with: the ones it created and the ones it
+// joined with a code (a teacher with two pupils sees both).
+export const listAccountChildren = async (
+  client: ReturnType<typeof createAuthedSupabaseClient>,
+  userId: string,
+): Promise<Array<{ id: string; name: string }>> => {
+  const own = await client
+    .from("children")
+    .select("id, display_name")
+    .eq("parent_id", userId)
+    .order("created_at", { ascending: true });
+  const all = [
+    ...(await getLinkedChildren(userId)),
+    ...((own.data ?? []) as ChildRow[]).map((child) => ({ id: child.id, name: child.display_name })),
+  ];
+  return all.filter((child, index) => all.findIndex((item) => item.id === child.id) === index);
+};
+
 // A child this account already works with: the one this device last used if
 // the account can still open it, else one it joined with a code, else its own.
 const findExistingChild = async (
@@ -169,12 +189,56 @@ const findExistingChild = async (
   return all.find((child) => child.id === knownChildId) ?? linked[0] ?? ownChildren[0] ?? null;
 };
 
+const SITE_URL = "https://smart-aac.vercel.app";
+
+const escapeHtml = (value: string): string =>
+  value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char);
+
+// The child's code is needed at every sign-in, so whoever joins a child (or
+// creates one) gets it by email to keep. A failed email never blocks sign-in.
+const emailChildCode = async (input: {
+  to: string;
+  name: string;
+  childName: string;
+  code: string;
+  isCreator: boolean;
+}): Promise<void> => {
+  if (!input.to || !input.code) return;
+  const greeting = input.name ? `שלום ${input.name},` : "שלום,";
+  const intro = input.isCreator
+    ? `יצרת פרופיל חדש ל${input.childName} ב-SmartAAC.`
+    : `הצטרפת לצוות של ${input.childName} ב-SmartAAC.`;
+  const text = [
+    greeting,
+    "",
+    intro,
+    `קוד הילד/ה: ${input.code}`,
+    "",
+    "את הקוד מקישים בכל כניסה (יחד עם האימייל והסיסמה), והמערכת נכנסת ישר לילד/ה.",
+    "שמרו את המייל הזה.",
+    "",
+    `כניסה: ${SITE_URL}`,
+  ].join("\n");
+  const html = `<div dir="rtl" style="font-family:Arial,sans-serif;font-size:16px;line-height:1.7;color:#0f172a">
+<p>${escapeHtml(greeting)}</p>
+<p>${escapeHtml(intro)}</p>
+<p style="margin:20px 0">קוד הילד/ה:<br><strong style="display:inline-block;margin-top:6px;padding:10px 18px;border-radius:12px;background:#eef2ff;color:#3730a3;font-size:26px;letter-spacing:3px" dir="ltr">${escapeHtml(input.code)}</strong></p>
+<p>את הקוד מקישים בכל כניסה (יחד עם האימייל והסיסמה), והמערכת נכנסת ישר לילד/ה. שמרו את המייל הזה.</p>
+<p><a href="${SITE_URL}" style="display:inline-block;padding:10px 20px;border-radius:999px;background:#4f46e5;color:#fff;text-decoration:none;font-weight:bold">כניסה ל-SmartAAC</a></p>
+</div>`;
+  try {
+    await sendEmail({ to: input.to, subject: `קוד הילד/ה של ${input.childName} ב-SmartAAC`, text, html });
+  } catch {
+    // the code is also shown in the dashboard ("סקירה")
+  }
+};
+
 const joinChildByCode = async (
   rawCode: string,
   userName: string,
   userId: string,
   role: AuthMode,
-): Promise<ChildRow> => {
+): Promise<ChildRow & { isNewMember: boolean }> => {
   const code = rawCode.trim();
   if (!code) {
     throw new Error("צריך להזין קוד ילד כדי שהמערכת תדע על איזה ילד לעבוד.");
@@ -223,6 +287,14 @@ const joinChildByCode = async (
     role,
   });
 
+  const existingLink = await admin
+    .from("child_caregivers")
+    .select("child_id")
+    .eq("child_id", child.data.id)
+    .eq("caregiver_id", userId)
+    .maybeSingle();
+  const isNewMember = !existingLink.data;
+
   const caregiverLink = await admin.from("child_caregivers").upsert(
     {
       child_id: child.data.id,
@@ -242,7 +314,7 @@ const joinChildByCode = async (
     }
   }
 
-  return child.data as ChildRow;
+  return { ...(child.data as ChildRow), isNewMember };
 };
 
 export const ensureUserProfile = async (
@@ -458,6 +530,55 @@ export const rotateTeacherAccessCode = async (input: {
   return code;
 };
 
+// "כניסה": only the child's code and a password. The code finds the child;
+// the password finds which of the child's parents / teachers is signing in.
+export const loginWithChildCode = async (input: {
+  code: string;
+  password: string;
+}): Promise<AuthSuccessPayload> => {
+  const admin = createAdminSupabaseClient();
+  if (!admin) throw new Error("חסר SUPABASE_SERVICE_ROLE_KEY בשרת.");
+
+  const codes = await admin.from("child_access_codes").select("child_id, code_hash").eq("is_active", true);
+  if (codes.error) throw new Error(codes.error.message);
+  const codeHash = hashAccessCode(input.code.trim());
+  const match = codes.data?.find((row) => row.code_hash === codeHash);
+  if (!match) throw new Error("WRONG_CODE_OR_PASSWORD");
+
+  // The child's care team: whoever created it and everyone who joined.
+  const [child, caregivers] = await Promise.all([
+    admin.from("children").select("parent_id, caregiver_id").eq("id", match.child_id).maybeSingle(),
+    admin.from("child_caregivers").select("caregiver_id").eq("child_id", match.child_id),
+  ]);
+  const memberIds = [
+    child.data?.parent_id,
+    ...(caregivers.data ?? []).map((row) => row.caregiver_id),
+    child.data?.caregiver_id,
+  ].filter((id, index, all): id is string => typeof id === "string" && all.indexOf(id) === index);
+
+  for (const memberId of memberIds) {
+    const member = await admin.auth.admin.getUserById(memberId);
+    const email = member.data.user?.email;
+    if (!email) continue;
+    const signedIn = await signInWithPassword(email, input.password);
+    if (!signedIn.session) continue;
+
+    const profile = await admin.from("users").select("full_name, role").eq("id", memberId).maybeSingle();
+    const mode: AuthMode = profile.data?.role === "teacher" ? "teacher" : "parent";
+    const name = profile.data?.full_name || (mode === "teacher" ? "מורה" : "הורה");
+    const payload = await completeAuthSetup({
+      session: signedIn.session,
+      mode,
+      accountType: "join",
+      email,
+      name,
+      childAccessCode: input.code.trim(),
+    });
+    return { ...payload, mode };
+  }
+  throw new Error("WRONG_CODE_OR_PASSWORD");
+};
+
 export const completeAuthSetup = async (input: {
   session: SupabaseAuthSession;
   mode: AuthMode;
@@ -476,6 +597,16 @@ export const completeAuthSetup = async (input: {
   const client = createAuthedSupabaseClient(input.session.access_token);
   const userId = input.session.user.id;
 
+  // Signing in to a child (not creating one): an account that already exists
+  // keeps the role and name it registered with — the "כניסה" screen (code +
+  // Google) doesn't ask for them.
+  if (input.accountType === "join") {
+    const saved = await client.from("users").select("full_name, role").eq("id", userId).maybeSingle();
+    if (saved.data?.role === "parent" || saved.data?.role === "teacher") {
+      input = { ...input, mode: saved.data.role, name: saved.data.full_name || input.name };
+    }
+  }
+
   await ensureUserProfile(client, userId, input.name, input.mode);
 
   if (input.accountType === "join") {
@@ -483,7 +614,17 @@ export const completeAuthSetup = async (input: {
     // works with — one it created, or one it joined with a code before.
     let activeChild: ChildRow;
     if (input.childAccessCode?.trim()) {
-      activeChild = await joinChildByCode(input.childAccessCode, input.name, userId, input.mode);
+      const joined = await joinChildByCode(input.childAccessCode, input.name, userId, input.mode);
+      activeChild = joined;
+      if (joined.isNewMember) {
+        await emailChildCode({
+          to: input.email,
+          name: input.name,
+          childName: joined.display_name,
+          code: input.childAccessCode.trim(),
+          isCreator: false,
+        });
+      }
     } else {
       const known = await findExistingChild(client, userId, input.knownChildId);
       if (!known) {
@@ -491,7 +632,7 @@ export const completeAuthSetup = async (input: {
       }
       activeChild = known;
     }
-    const linkedChildren = await getLinkedChildren(userId);
+    const linkedChildren = await listAccountChildren(client, userId);
     const allLinkedChildren = linkedChildren.some((child) => child.id === activeChild.id)
       ? linkedChildren
       : [...linkedChildren, { id: activeChild.id, name: activeChild.display_name }];
@@ -556,6 +697,17 @@ export const completeAuthSetup = async (input: {
     input.knownInviteCode,
   );
 
+  // A brand-new child profile: its creator gets the code by email to keep.
+  if (isFirstLogin && teacherInviteCode) {
+    await emailChildCode({
+      to: input.email,
+      name: input.name,
+      childName: childRow.display_name,
+      code: teacherInviteCode,
+      isCreator: true,
+    });
+  }
+
   const teacherEmail = input.teacherEmail?.trim().toLowerCase() ?? "";
   if (teacherEmail) {
     const admin = createAdminSupabaseClient();
@@ -582,6 +734,7 @@ export const completeAuthSetup = async (input: {
     savedInSupabase: true,
     childId: childRow.id,
     childName: childRow.display_name,
+    linkedChildren: await listAccountChildren(client, userId),
     teacherInviteCode,
     teacherEmail: teacherEmail || undefined,
     isFirstLogin,

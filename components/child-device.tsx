@@ -342,7 +342,7 @@ export function ChildDevicePanel({
       ) : (
         <>
           <p className="mt-1 text-slate-700">
-            זה הטאבלט של {childName || "הילד/ה"}? הוא ייפתח ישר ללוח התקשורת, וההגדרות יהיו מוגנות בקוד הורה.
+            זה המסך של {childName || "הילד/ה"}? הוא ייפתח ישר ללוח התקשורת, וההגדרות יהיו מוגנות בקוד הורה.
           </p>
           <div className="mt-3 grid gap-2">
             <PinFields pin={pin} confirm={confirm} onPinChange={setPin} onConfirmChange={setConfirm} />

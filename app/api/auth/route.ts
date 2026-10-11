@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
-import { completeAuthSetup } from "@/lib/auth-setup";
+import { completeAuthSetup, loginWithChildCode } from "@/lib/auth-setup";
 import { authenticateUser, isServerSupabaseConfigured } from "@/lib/supabase-server";
 
 type AuthMode = "parent" | "teacher";
 type AccountType = "create" | "join";
 
 type AuthRequest = {
+  action?: "codeLogin";
   mode?: AuthMode;
   accountType?: AccountType;
   email?: string;
@@ -29,6 +30,22 @@ export async function POST(request: Request): Promise<NextResponse> {
     body = (await request.json()) as AuthRequest;
   } catch {
     return NextResponse.json({ error: "בקשה לא תקינה" }, { status: 400 });
+  }
+
+  // "כניסה": the child's code + password only.
+  if (body.action === "codeLogin") {
+    const code = body.childAccessCode?.trim() ?? "";
+    if (!code || !body.password) {
+      return NextResponse.json({ error: "צריך קוד ילד/ה וסיסמה." }, { status: 400 });
+    }
+    try {
+      return NextResponse.json(await loginWithChildCode({ code, password: body.password }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      return message === "WRONG_CODE_OR_PASSWORD"
+        ? NextResponse.json({ error: "הקוד או הסיסמה לא נכונים." }, { status: 401 })
+        : NextResponse.json({ error: message || "אירעה שגיאה. נסו שוב." }, { status: 500 });
+    }
   }
 
   const mode = body.mode;

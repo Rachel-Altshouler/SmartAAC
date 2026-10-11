@@ -302,6 +302,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
     linkedChildren?: Array<{ id: string; name: string }>;
     session?: { access_token: string; refresh_token: string };
     accountType?: AccountType;
+    mode?: "parent" | "teacher";
   };
 
   if (!setupRes.ok || !payload.userId) {
@@ -325,7 +326,7 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
     childId: payload.childId,
     childName: payload.childName,
     linkedChildren: payload.linkedChildren,
-    mode: draft.mode,
+    mode: payload.mode ?? draft.mode,
     accountType: payload.accountType ?? draft.accountType,
   };
 }
@@ -1100,7 +1101,7 @@ const translateAuthError = (message: string): string => {
     return "חסרה פונקציה ב-Supabase. הריצו שוב את supabase/schema.sql ב-SQL Editor ואז רעננו.";
   }
   if (lower.includes("invalid child access code")) {
-    return "קוד הילד שגוי. בקשי מההורה קוד חדש מלוח הבקרה → צור קוד חדש למורה.";
+    return "קוד הילד/ה לא נכון. בדקו אותו — הקוד מופיע בלוח הבקרה, במסך \"סקירה\".";
   }
   if (lower.includes("gen_salt") || lower.includes("function crypt")) {
     return "עדכנו את הקוד. הפעילי מחדש npm run dev, ההורה יוצרת קוד חדש, והמורה מתחברת עם הקוד החדש.";
@@ -1188,6 +1189,8 @@ export function SmartAACDemo() {
   const [teacherEmail, setTeacherEmail] = useState("");
   const [inviteMessage, setInviteMessage] = useState("");
   const [rememberMe, setRememberMe] = useState(true);
+  // "login" = the child's code + password only; "register" = all the details.
+  const [authScreen, setAuthScreen] = useState<"login" | "register">("login");
   const [savedSession, setSavedSession] = useState<{
     name: string;
     email: string;
@@ -1791,13 +1794,6 @@ export function SmartAACDemo() {
     state.storyResults,
   ]);
 
-  const continueSavedSession = (): void => {
-    if (!savedSession) return;
-    setIsLoginOpen(false);
-    setIsEntryOpen(false);
-    setIsDashboardOpen(true);
-  };
-
   const saveRememberedAuth = (email: string, name: string): void => {
     if (!rememberMe) {
       window.localStorage.removeItem(rememberedAuthKey);
@@ -2214,6 +2210,10 @@ export function SmartAACDemo() {
       setAuthMessage("להרשמה ב-Supabase צריך אימייל וסיסמה של לפחות 6 תווים.");
       return;
     }
+    if (authAccountType === "join" && !childAccessCode.trim()) {
+      setAuthMessage("כתבו את קוד הילד/ה — לפיו המערכת יודעת לאיזה ילד/ה להיכנס.");
+      return;
+    }
 
 
     const resolved = resolveAuthFields(parentName.trim(), parentEmail.trim());
@@ -2305,9 +2305,66 @@ export function SmartAACDemo() {
     }
   };
 
+  const submitCodeLogin = async (): Promise<void> => {
+    const code = childAccessCode.trim();
+    if (!code || !password) {
+      setAuthMessage("כתבו את קוד הילד/ה ואת הסיסמה שלך.");
+      return;
+    }
+    setIsAuthLoading(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "codeLogin", childAccessCode: code, password }),
+      });
+      const payload = (await readJsonResponse(response)) as {
+        error?: string;
+        session?: { access_token: string; refresh_token: string };
+        teacherInviteCode?: string;
+        userId?: string;
+        childId?: string;
+        childName?: string;
+        linkedChildren?: Array<{ id: string; name: string }>;
+        email?: string;
+        name?: string;
+        mode?: AuthMode;
+      };
+      if (!response.ok || !payload.email) throw new Error(payload.error ?? "לא הצלחנו להתחבר.");
+      if (supabase && payload.session) {
+        await supabase.auth
+          .setSession({ access_token: payload.session.access_token, refresh_token: payload.session.refresh_token })
+          .catch(() => undefined);
+      }
+      setParentEmail(payload.email);
+      setParentName(payload.name ?? "");
+      finishAuthSuccess({
+        email: payload.email,
+        name: payload.name ?? "",
+        teacherInviteCode: payload.teacherInviteCode ?? code,
+        userId: payload.userId,
+        childId: payload.childId,
+        childName: payload.childName,
+        linkedChildren: payload.linkedChildren,
+        role: payload.mode ?? "parent",
+        accountType: "join",
+      });
+    } catch (error) {
+      setAuthMessage(translateAuthError(getErrorMessage(error)));
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
   const loginWithGoogle = async (): Promise<void> => {
     if (!supabase) {
       setAuthMessage("Google דורש חיבור Supabase.");
+      return;
+    }
+    const googleAccountType: AccountType = authScreen === "login" ? "join" : authAccountType;
+    if (googleAccountType === "join" && !childAccessCode.trim()) {
+      setAuthMessage("כתבו קודם את קוד הילד/ה, ואז לחצו על Google.");
       return;
     }
 
@@ -2317,7 +2374,7 @@ export function SmartAACDemo() {
     try {
       const draft: AuthDraft = {
         mode: authMode,
-        accountType: authAccountType,
+        accountType: googleAccountType,
         name: parentName.trim() || (authMode === "parent" ? "הורה" : "מורה"),
         email: parentEmail.trim(),
         childName: childName.trim() || "דניאל",
@@ -2587,23 +2644,6 @@ export function SmartAACDemo() {
             </h1>
           </div>
 
-          {savedSession && (
-            <button
-              type="button"
-              className="mx-auto mb-5 flex w-full max-w-3xl items-center gap-4 rounded-[1.75rem] bg-white/90 p-5 text-right shadow-soft ring-1 ring-violet-100 transition hover:-translate-y-0.5"
-              onClick={continueSavedSession}
-            >
-              <span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-violet-100 text-3xl">🔓</span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-xl font-bold">שלום {savedSession.name}, להמשיך ללוח הבקרה?</span>
-                <span className="mt-0.5 block truncate text-sm text-muted">
-                  <span dir="ltr">{savedSession.email}</span> · {savedSession.role === "teacher" ? "מורה" : "הורה"}
-                </span>
-              </span>
-              <span className="shrink-0 rounded-full bg-violet-600 px-5 py-2.5 font-bold text-white">כניסה מהירה ←</span>
-            </button>
-          )}
-
           <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-5 md:grid-cols-2">
             <button
               type="button"
@@ -2626,7 +2666,10 @@ export function SmartAACDemo() {
             <button
               type="button"
               className="group flex h-full flex-col items-center rounded-[2rem] bg-white/90 p-8 text-center shadow-soft ring-1 ring-blue-100 transition hover:-translate-y-1"
-              onClick={() => setIsLoginOpen(true)}
+              onClick={() => {
+                setAuthScreen("login");
+                setIsLoginOpen(true);
+              }}
             >
               <span className="grid h-24 w-24 place-items-center rounded-full bg-gradient-to-br from-blue-100 to-indigo-200 text-6xl transition group-hover:scale-105">
                 👩‍👧
@@ -2636,7 +2679,7 @@ export function SmartAACDemo() {
                 אירועים, נושא שבועי, תמונות מהיום, סמלים, הדפסה ומעקב התקדמות.
               </span>
               <span className="mt-6 inline-flex rounded-full bg-gradient-to-l from-blue-600 to-indigo-600 px-6 py-3 font-bold text-white shadow-sm">
-                כניסה עם סיסמה
+                כניסה / הרשמה
               </span>
             </button>
           </div>
@@ -2668,6 +2711,13 @@ export function SmartAACDemo() {
             onSubmit={submitPassword}
             onQuickEntry={quickParentEntry}
           onForgotPassword={() => void sendPasswordReset()}
+          authScreen={authScreen}
+          onAuthScreenChange={(screen) => {
+            setAuthScreen(screen);
+            setAuthMessage("");
+            if (screen === "login") setAuthAccountType("join");
+          }}
+          onCodeLogin={() => void submitCodeLogin()}
           />
         )}
       </main>
@@ -2830,9 +2880,8 @@ export function SmartAACDemo() {
             // elsewhere this is the regular parent/teacher sign-in.
             if (isChildDevice) {
               setIsParentPinOpen(true);
-            } else if (savedSession) {
-              continueSavedSession();
             } else {
+              setAuthScreen("login");
               setIsLoginOpen(true);
             }
           }}
@@ -2961,6 +3010,13 @@ export function SmartAACDemo() {
           onSubmit={submitPassword}
           onQuickEntry={quickParentEntry}
           onForgotPassword={() => void sendPasswordReset()}
+          authScreen={authScreen}
+          onAuthScreenChange={(screen) => {
+            setAuthScreen(screen);
+            setAuthMessage("");
+            if (screen === "login") setAuthAccountType("join");
+          }}
+          onCodeLogin={() => void submitCodeLogin()}
         />
       )}
 
@@ -3008,6 +3064,9 @@ function LoginModal({
   onSubmit,
   onQuickEntry,
   onForgotPassword,
+  authScreen,
+  onAuthScreenChange,
+  onCodeLogin,
 }: {
   password: string;
   parentName: string;
@@ -3033,24 +3092,159 @@ function LoginModal({
   onSubmit: () => void;
   onQuickEntry: () => void;
   onForgotPassword: () => void;
+  authScreen: "login" | "register";
+  onAuthScreenChange: (screen: "login" | "register") => void;
+  onCodeLogin: () => void;
 }) {
+  const [isForgotOpen, setIsForgotOpen] = useState(false);
+  const screenTabs = supabaseReady && (
+    <div className="mb-4 grid grid-cols-2 gap-1 rounded-2xl bg-slate-100 p-1">
+      {(
+        [
+          ["login", "כניסה"],
+          ["register", "הרשמה"],
+        ] as const
+      ).map(([id, label]) => (
+        <button
+          key={id}
+          type="button"
+          className={cx(
+            "rounded-xl px-4 py-3 text-lg font-black text-slate-600",
+            authScreen === id && "bg-white text-blue-700 shadow-sm",
+          )}
+          onClick={() => onAuthScreenChange(id)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (supabaseReady && authScreen === "login") {
+    return (
+      <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+        <div className="flex min-h-full justify-center">
+          <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
+            {screenTabs}
+            <div className="mb-4 rounded-2xl bg-blue-50 p-4">
+              <h2 className="mb-1 text-2xl font-black">כניסה</h2>
+              <p className="text-muted">קוד הילד/ה והסיסמה שלך — והמערכת מזהה אותך ונכנסת ישר לילד/ה.</p>
+            </div>
+            <div className="grid gap-3">
+              <label className="grid gap-1">
+                <span className="text-sm font-black text-slate-600">קוד הילד/ה</span>
+                <input
+                  className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-center text-lg font-bold tracking-widest"
+                  dir="ltr"
+                  value={childAccessCode}
+                  onChange={(event) => onChildAccessCodeChange(event.target.value)}
+                  placeholder="AAC-1234"
+                />
+              </label>
+              <label className="grid gap-1">
+                <span className="text-sm font-black text-slate-600">הסיסמה שלך</span>
+                <input
+                  className="w-full rounded-2xl border border-slate-200 px-4 py-3"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => onPasswordChange(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") onCodeLogin();
+                  }}
+                />
+              </label>
+            </div>
+            <button
+              type="button"
+              className="mt-2 text-sm font-black text-blue-700 underline"
+              onClick={() => setIsForgotOpen((open) => !open)}
+            >
+              שכחתי סיסמה
+            </button>
+            {isForgotOpen && (
+              <div className="mt-2 grid gap-2 rounded-2xl bg-slate-50 p-3">
+                <span className="text-sm font-bold text-slate-600">האימייל שאיתו נרשמת — נשלח אליו קישור לסיסמה חדשה:</span>
+                <input
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2"
+                  type="email"
+                  dir="ltr"
+                  value={parentEmail}
+                  onChange={(event) => onParentEmailChange(event.target.value)}
+                  placeholder="name@email.com"
+                />
+                <button
+                  type="button"
+                  className="rounded-xl bg-white px-4 py-2 font-black text-blue-700 ring-1 ring-blue-200"
+                  onClick={onForgotPassword}
+                >
+                  שליחת קישור
+                </button>
+              </div>
+            )}
+            {authMessage && (
+              <p className="mt-3 rounded-2xl bg-amber-50 p-3 text-sm font-bold text-amber-900">{authMessage}</p>
+            )}
+            <button
+              type="button"
+              className="mt-5 w-full rounded-2xl bg-blue-500 px-5 py-3 text-lg font-bold text-white disabled:opacity-60"
+              onClick={onCodeLogin}
+              disabled={isLoading}
+            >
+              {isLoading ? "מתחבר..." : "כניסה"}
+            </button>
+            {/* whoever signed up with Google has no password: the child's code + Google */}
+            <button
+              type="button"
+              className="mt-3 flex w-full items-center justify-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 font-black shadow-sm"
+              onClick={onGoogle}
+              disabled={isLoading}
+            >
+              <svg className="h-5 w-5 shrink-0" viewBox="0 0 48 48" aria-hidden="true">
+                <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+              </svg>
+              כניסה עם Google (עם קוד הילד/ה)
+            </button>
+            <p className="mt-3 text-center text-sm text-muted">
+              עוד אין לך חשבון?{" "}
+              <button type="button" className="font-black text-blue-700 underline" onClick={() => onAuthScreenChange("register")}>
+                הרשמה
+              </button>
+            </p>
+            <button
+              type="button"
+              className="mt-3 w-full rounded-2xl border border-slate-200 px-5 py-3 font-bold"
+              onClick={onCancel}
+            >
+              ביטול
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
       <div className="flex min-h-full justify-center">
         <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
+        {screenTabs}
         <div className="mb-4 rounded-2xl bg-blue-50 p-4">
           <h2 className="mb-1 text-2xl font-black">
             {supabaseReady
               ? accountType === "create"
-                ? "יצירת פרופיל חדש"
-                : "כניסה או הצטרפות עם קוד"
+                ? "הרשמה — פרופיל חדש לילד/ה"
+                : "הרשמה — הצטרפות לילד/ה עם קוד"
               : "כניסה למערכת"}
           </h2>
           <p className="text-muted">
             {supabaseReady
               ? accountType === "create"
                 ? "מלא/י אימייל וסיסמה. המערכת תיצור חשבון ופרופיל ילד חדש — ותקבל/י קוד לשתף עם מי שתרצ/י להזמין."
-                : "בפעם הראשונה: אימייל, סיסמה והקוד שקיבלת. בכניסה חוזרת מספיקים אימייל וסיסמה — גם למי שיצר את הפרופיל."
+                : "בפעם הראשונה: אימייל, שם, הקוד שקיבלת וסיסמה. מהפעם הבאה נכנסים בלשונית \"כניסה\" רק עם הקוד והסיסמה."
               : "אין חיבור Supabase. אפשר לנסות את לוח הבקרה בלבד, בלי שמירה בשרת."}
           </p>
         </div>
@@ -3082,7 +3276,7 @@ function LoginModal({
         {supabaseReady && (
           <div className="mb-4">
             <span className="mb-1 block text-xs font-black text-slate-500">
-              יוצר/ת פרופיל חדש או מצטרפ/ת לקיים?
+              פרופיל חדש או הצטרפות לילד/ה קיים/ת?
             </span>
             <div className="grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1">
               <button
@@ -3103,7 +3297,7 @@ function LoginModal({
                 )}
                 onClick={() => onAccountTypeChange("join")}
               >
-                כניסה / יש לי קוד
+                הצטרפות עם קוד
               </button>
             </div>
           </div>
@@ -3172,13 +3366,13 @@ function LoginModal({
             </label>
           ) : (
             <label className="grid gap-1">
-              <span className="text-sm font-black text-slate-600">קוד הילד (רק בפעם הראשונה)</span>
+              <span className="text-sm font-black text-slate-600">קוד הילד/ה</span>
               <input
                 className="w-full rounded-2xl border border-slate-200 px-4 py-3"
                 dir="ltr"
                 value={childAccessCode}
                 onChange={(event) => onChildAccessCodeChange(event.target.value)}
-                placeholder="בכניסה חוזרת אפשר להשאיר ריק"
+                placeholder="AAC-1234"
               />
             </label>
           )}
@@ -3206,14 +3400,6 @@ function LoginModal({
             שכחתי סיסמה
           </button>
         )}
-        <label className="mt-3 flex items-center gap-2 text-sm font-bold text-slate-700">
-          <input
-            type="checkbox"
-            checked={rememberMe}
-            onChange={(event) => onRememberMeChange(event.target.checked)}
-          />
-          זכור אותי — כניסה מהירה בפעם הבאה
-        </label>
         {authMessage && (
           <p className="mt-3 rounded-2xl bg-amber-50 p-3 text-sm font-bold text-amber-900">
             {authMessage}
@@ -3230,8 +3416,8 @@ function LoginModal({
               ? "מתחבר..."
               : supabaseReady
                 ? accountType === "create"
-                  ? "הרשמה / כניסה"
-                  : "כניסה"
+                  ? "הרשמה"
+                  : "הרשמה והצטרפות"
                 : "כניסה מקומית"}
           </button>
           <div className="flex flex-wrap justify-end gap-3">
@@ -5292,13 +5478,14 @@ function Dashboard({
                     </div>
                     <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
                       <span className="block text-sm font-black text-muted">
-                        קוד הילד/ה — אותו קוד לכל ההורים והמורים
+                        קוד הצטרפות לילד/ה
                       </span>
                       <span className="mt-1 block text-3xl font-black tracking-widest" dir="ltr">
                         {state.teacherInviteCode || "—"}
                       </span>
                       <span className="mt-2 block text-xs leading-5 text-muted">
-                        מי שמקבל/ת את הקוד נכנס/ת איתו לאותו ילד/ה, ורואה את אותן תמונות, הגדרות ואירועים.
+                        שולחים את הקוד להורה או למורה שרוצים לצרף. צריך אותו רק בכניסה הראשונה — אחר כך נכנסים
+                        עם מייל וסיסמה, וכולם רואים את אותן תמונות, הגדרות ואירועים.
                       </span>
                     </div>
                     <button
@@ -5328,7 +5515,7 @@ function Dashboard({
                       className="mt-4 rounded-2xl bg-blue-600 px-5 py-3 font-black text-white disabled:opacity-60"
                       disabled={isRotatingCode}
                       onClick={() => {
-                        if (!window.confirm("קוד חדש מבטל את הקוד הנוכחי. מי שעוד לא הצטרף יצטרך את הקוד החדש. להמשיך?")) return;
+                        if (!window.confirm("הקוד הנוכחי יפסיק לעבוד ויהיה קוד חדש במקומו. מי שכבר הצטרף ממשיך להיכנס כרגיל — רק מי שעוד לא הצטרף יצטרך את הקוד החדש. להמשיך?")) return;
                         setCodeMessage("");
                         setIsRotatingCode(true);
                         void onRotateTeacherCode()
@@ -5347,7 +5534,7 @@ function Dashboard({
                           });
                       }}
                     >
-                      {isRotatingCode ? "יוצר קוד..." : "צור קוד גישה חדש"}
+                      {isRotatingCode ? "יוצר קוד..." : "🔄 החלפת הקוד (אם הגיע למישהו בטעות)"}
                     </button>
                     )}
                     {codeMessage && (
