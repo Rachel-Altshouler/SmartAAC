@@ -177,6 +177,19 @@ export async function geminiChat(options: {
   });
 }
 
+// Looks at a photo (a data: URL) and answers the prompt about it.
+export async function geminiDescribeImage(
+  dataUrl: string,
+  prompt: string,
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const match = dataUrl.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+  if (!match) return { ok: false, error: "not an image" };
+  return geminiGenerate(
+    [{ role: "user", parts: [{ inline_data: { mime_type: match[1] as string, data: match[2] as string } }, { text: prompt }] }],
+    { temperature: 0.4, maxOutputTokens: 700 },
+  );
+}
+
 export async function geminiTranscribeAudio(
   audio: Blob,
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {

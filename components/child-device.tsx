@@ -208,27 +208,27 @@ function PinFields({
 }) {
   const clean = (value: string): string => value.replace(/\D/g, "").slice(0, PIN_LENGTH);
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid max-w-md gap-2 sm:grid-cols-2">
       <label className="grid gap-1">
-        <span className="text-sm font-black">קוד הורה (4 ספרות)</span>
+        <span className="text-xs font-black">קוד הורה (4 ספרות)</span>
         <input
           type="password"
           inputMode="numeric"
           autoComplete="new-password"
           dir="ltr"
-          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-center text-xl tracking-[0.5em]"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-center text-base tracking-[0.5em]"
           value={pin}
           onChange={(event) => onPinChange(clean(event.target.value))}
         />
       </label>
       <label className="grid gap-1">
-        <span className="text-sm font-black">שוב, לאימות</span>
+        <span className="text-xs font-black">שוב, לאימות</span>
         <input
           type="password"
           inputMode="numeric"
           autoComplete="new-password"
           dir="ltr"
-          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-center text-xl tracking-[0.5em]"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-center text-base tracking-[0.5em]"
           value={confirm}
           onChange={(event) => onConfirmChange(clean(event.target.value))}
         />
@@ -272,8 +272,8 @@ export function ChildDevicePanel({
   };
 
   return (
-    <div className="mb-6 rounded-soft border border-sky-200 bg-sky-50 p-5 shadow-sm">
-      <h2 className="text-xl font-black">📱 מכשיר של ילד</h2>
+    <div className="mb-6 rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm shadow-sm">
+      <h2 className="text-lg font-black">📱 המסך של {childName || "הילד/ה"}</h2>
       {enabled ? (
         <>
           <p className="mt-2 font-bold text-sky-950">
@@ -289,7 +289,7 @@ export function ChildDevicePanel({
               <div className="flex gap-2">
                 <button
                   type="button"
-                  className="rounded-2xl bg-sky-600 px-5 py-2.5 font-black text-white"
+                  className="rounded-2xl bg-sky-600 px-4 py-2 text-sm font-black text-white"
                   onClick={() =>
                     void savePin().then((saved) => {
                       if (!saved) return;
@@ -302,7 +302,7 @@ export function ChildDevicePanel({
                 </button>
                 <button
                   type="button"
-                  className="rounded-2xl border border-slate-200 bg-white px-5 py-2.5 font-black"
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-black"
                   onClick={() => {
                     setIsChangingPin(false);
                     setMessage("");
@@ -316,7 +316,7 @@ export function ChildDevicePanel({
             <div className="mt-4 flex flex-wrap gap-2">
               <button
                 type="button"
-                className="rounded-2xl border border-sky-300 bg-white px-5 py-2.5 font-black text-sky-900"
+                className="rounded-2xl border border-sky-300 bg-white px-4 py-2 text-sm font-black text-sky-900"
                 onClick={() => {
                   setIsChangingPin(true);
                   setMessage("");
@@ -326,7 +326,7 @@ export function ChildDevicePanel({
               </button>
               <button
                 type="button"
-                className="rounded-2xl border border-red-200 bg-white px-5 py-2.5 font-black text-red-700"
+                className="rounded-2xl border border-red-200 bg-white px-4 py-2 text-sm font-black text-red-700"
                 onClick={() => {
                   if (!window.confirm("להחזיר את המכשיר הזה למצב רגיל?")) return;
                   disableChildDevice();
@@ -341,15 +341,14 @@ export function ChildDevicePanel({
         </>
       ) : (
         <>
-          <p className="mt-2 text-slate-700">
-            זה הטאבלט של {childName || "הילד/ה"}? הפכו אותו למכשיר של הילד: הוא ייפתח ישר ללוח התקשורת, בלי
-            שם, מייל או קוד. ההגדרות יהיו מוגנות בקוד הורה של 4 ספרות.
+          <p className="mt-1 text-slate-700">
+            זה הטאבלט של {childName || "הילד/ה"}? הוא ייפתח ישר ללוח התקשורת, וההגדרות יהיו מוגנות בקוד הורה.
           </p>
-          <div className="mt-4 grid gap-3">
+          <div className="mt-3 grid gap-2">
             <PinFields pin={pin} confirm={confirm} onPinChange={setPin} onConfirmChange={setConfirm} />
             <button
               type="button"
-              className="justify-self-start rounded-2xl bg-sky-600 px-5 py-2.5 font-black text-white"
+              className="justify-self-start rounded-2xl bg-sky-600 px-4 py-2 text-sm font-black text-white"
               onClick={() =>
                 void savePin().then((saved) => {
                   if (!saved) return;
@@ -358,7 +357,7 @@ export function ChildDevicePanel({
                 })
               }
             >
-              📱 הפוך למכשיר של הילד
+              📱 הפוך למסך של {childName || "הילד/ה"}
             </button>
           </div>
         </>

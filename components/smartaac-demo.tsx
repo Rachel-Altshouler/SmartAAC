@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   type AacSymbol,
   type CalendarEvent,
@@ -36,6 +36,8 @@ import {
   type EventSymbolsResult,
 } from "@/lib/event-symbols";
 import { SharedLibraryDashboard } from "@/components/shared-library";
+import { ChildDailyStoryView, DailyStoryDashboard, prefetchDailyStory } from "@/components/daily-story";
+import { PrintSymbolsDashboard } from "@/components/print-symbols";
 import { ChildDevicePanel, isChildDeviceEnabled, ParentPinModal } from "@/components/child-device";
 import { buildLocalChildAiAnswer } from "@/lib/local-ai";
 import { buildTeacherInviteContent } from "@/lib/teacher-invite";
@@ -58,7 +60,8 @@ type ChildView =
   | { type: "keyboard" }
   | { type: "events" }
   | { type: "assistant" }
-  | { type: "story" };
+  | { type: "story" }
+  | { type: "daily" };
 
 const TYPED_TOKEN_PREFIX = "typed:";
 const MAX_TYPED_CHARS = 80;
@@ -98,6 +101,8 @@ type DashboardView =
   | "level"
   | "symbols"
   | "library"
+  | "daily"
+  | "print"
   | "progress";
 
 const storageKey = "smartaac-next-demo";
@@ -488,28 +493,6 @@ const stripEmoji = (text: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
-// The voice chosen on this device ("בחירת קול"); voices differ per device,
-// so this is kept on the device and not synced.
-const VOICE_KEY = "smartaac-voice";
-
-const readChosenVoice = (): string => {
-  try {
-    return window.localStorage.getItem(VOICE_KEY) ?? "";
-  } catch {
-    return "";
-  }
-};
-
-const hebrewVoicesOnDevice = (): SpeechSynthesisVoice[] =>
-  typeof window === "undefined" || !("speechSynthesis" in window)
-    ? []
-    : window.speechSynthesis
-        .getVoices()
-        .filter(
-          (voice) =>
-            voice.lang.startsWith("he") || voice.lang.startsWith("iw") || voice.name.toLowerCase().includes("hebrew"),
-        );
-
 const speakHebrew = (rawText: string, rate = 0.9, onEnd?: () => void): void => {
   const text = stripEmoji(rawText);
   if (!("speechSynthesis" in window) || !text) {
@@ -547,10 +530,7 @@ const speakHebrew = (rawText: string, rate = 0.9, onEnd?: () => void): void => {
       if (name.includes("asaf")) return 4;
       return 2;
     };
-    const chosen = readChosenVoice();
-    const hebrewVoice =
-      hebrewVoices.find((voice) => voice.name === chosen) ??
-      [...hebrewVoices].sort((left, right) => score(left) - score(right))[0];
+    const hebrewVoice = [...hebrewVoices].sort((left, right) => score(left) - score(right))[0];
     if (hebrewVoice) {
       utterance.voice = hebrewVoice;
     }
@@ -809,16 +789,122 @@ const firstGrapheme = (value: string): string => {
   return Array.from(trimmed)[0] ?? trimmed;
 };
 
+// Hebrew search in the ARASAAC pictograms (the same symbols as the board).
+const searchPictograms = async (query: string): Promise<number[]> => {
+  const response = await fetch(`https://api.arasaac.org/v1/pictograms/he/search/${encodeURIComponent(query)}`, {
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) return [];
+  const results = (await response.json()) as Array<{ _id?: number }>;
+  return results
+    .map((item) => item._id)
+    .filter((id): id is number => typeof id === "number")
+    .slice(0, 30);
+};
+
+// "🖼️ סמלים": pick a real pictogram by searching a word.
+function PictogramSearch({
+  suggestion,
+  value,
+  onChange,
+}: {
+  suggestion: string;
+  value?: number;
+  onChange: (pictogramId: number | undefined) => void;
+}) {
+  const [query, setQuery] = useState(suggestion);
+  const [results, setResults] = useState<number[]>([]);
+  const [status, setStatus] = useState<"idle" | "loading" | "empty" | "error">("idle");
+  const touched = useRef(false);
+
+  // Follows the name typed above until the user types a search of their own.
+  useEffect(() => {
+    if (!touched.current) setQuery(suggestion);
+  }, [suggestion]);
+
+  useEffect(() => {
+    const word = query.trim();
+    if (!word) {
+      setResults([]);
+      setStatus("idle");
+      return;
+    }
+    let cancelled = false;
+    setStatus("loading");
+    const timer = window.setTimeout(() => {
+      void searchPictograms(word)
+        .then((ids) => {
+          if (cancelled) return;
+          setResults(ids);
+          setStatus(ids.length ? "idle" : "empty");
+        })
+        .catch(() => {
+          if (!cancelled) setStatus("error");
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [query]);
+
+  return (
+    <div>
+      <input
+        className="mb-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+        value={query}
+        onChange={(event) => {
+          touched.current = true;
+          setQuery(event.target.value);
+        }}
+        placeholder="חיפוש סמל, למשל: מכונת כביסה"
+      />
+      <div className="max-h-56 overflow-y-auto rounded-xl border border-slate-100 bg-slate-50 p-2">
+        <div className="grid grid-cols-4 gap-1.5">
+          {results.map((id) => (
+            <button
+              key={id}
+              type="button"
+              className={cx(
+                "rounded-lg border bg-white p-1 transition",
+                value === id ? "border-blue-500 ring-2 ring-blue-200" : "border-slate-200 hover:bg-slate-100",
+              )}
+              onClick={() => onChange(value === id ? undefined : id)}
+              aria-label="בחר סמל"
+            >
+              <img src={arasaacImageUrl(id)} alt="" className="h-14 w-full object-contain" loading="lazy" />
+            </button>
+          ))}
+        </div>
+        {status === "loading" && <p className="p-3 text-center text-sm text-muted">מחפשים סמלים…</p>}
+        {status === "empty" && <p className="p-3 text-center text-sm text-muted">לא נמצאו סמלים. נסו מילה אחרת.</p>}
+        {status === "error" && <p className="p-3 text-center text-sm text-muted">החיפוש לא הצליח. נסו שוב.</p>}
+        {status === "idle" && results.length === 0 && (
+          <p className="p-3 text-center text-sm text-muted">כתבו מילה כדי לחפש סמל.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EmojiPickerField({
   label,
   value,
   onChange,
+  pictogramId,
+  onPictogramChange,
+  suggestion = "",
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
+  // With these, a "🖼️ סמלים" tab lets the user pick a real pictogram instead.
+  pictogramId?: number;
+  onPictogramChange?: (pictogramId: number | undefined) => void;
+  suggestion?: string;
 }) {
   const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<"pictograms" | "emoji">(onPictogramChange ? "pictograms" : "emoji");
   const inputRef = useRef<HTMLInputElement>(null);
 
   const filteredChoices = useMemo(() => {
@@ -846,14 +932,47 @@ function EmojiPickerField({
       <label className="mb-2 block text-sm font-black text-slate-700">{label}</label>
       <div className="rounded-2xl border border-slate-200 bg-white p-3">
         <div className="mb-3 flex min-h-14 items-center justify-center rounded-xl bg-slate-50 text-4xl">
-          {value || "⭐"}
+          {pictogramId ? (
+            <img src={arasaacImageUrl(pictogramId)} alt="" className="h-14 w-14 object-contain" />
+          ) : (
+            value || "⭐"
+          )}
         </div>
+        {onPictogramChange && (
+          <div className="mb-3 grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
+            {(
+              [
+                ["pictograms", "🖼️ סמלים"],
+                ["emoji", "😀 אימוג׳י"],
+              ] as const
+            ).map(([id, text]) => (
+              <button
+                key={id}
+                type="button"
+                className={cx(
+                  "rounded-lg px-3 py-1.5 text-sm font-black text-slate-600",
+                  tab === id && "bg-white text-blue-700 shadow-sm",
+                )}
+                onClick={() => setTab(id)}
+              >
+                {text}
+              </button>
+            ))}
+          </div>
+        )}
+        {tab === "pictograms" && onPictogramChange ? (
+          <PictogramSearch suggestion={suggestion} value={pictogramId} onChange={onPictogramChange} />
+        ) : (
+        <>
         <div className="mb-3 flex flex-wrap gap-2">
           <input
             ref={inputRef}
             className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-center text-sm"
             value={value}
-            onChange={(event) => onChange(firstGrapheme(event.target.value))}
+            onChange={(event) => {
+              onChange(firstGrapheme(event.target.value));
+              onPictogramChange?.(undefined);
+            }}
             placeholder="הדביק/י אימוג׳י או הקליד/י"
             aria-label={label}
           />
@@ -883,7 +1002,10 @@ function EmojiPickerField({
                     ? "border-blue-500 bg-blue-50 ring-2 ring-blue-200"
                     : "border-slate-200 bg-white hover:bg-slate-100",
                 )}
-                onClick={() => onChange(emoji)}
+                onClick={() => {
+                  onChange(emoji);
+                  onPictogramChange?.(undefined);
+                }}
                 aria-label={`בחר ${emoji}`}
               >
                 {emoji}
@@ -897,6 +1019,8 @@ function EmojiPickerField({
         <p className="mt-2 text-xs text-muted">
           {allEmojiChoices.length} אימוג׳ים · Windows: Win+. · Mac: Ctrl+Cmd+Space
         </p>
+        </>
+        )}
       </div>
     </div>
   );
@@ -1355,6 +1479,8 @@ export function SmartAACDemo() {
               payload.symbolSettings?.enabledCategoryIds ?? current.enabledCategoryIds,
             customSymbols: payload.symbolSettings?.customSymbols ?? current.customSymbols,
             customCategories: payload.symbolSettings?.customCategories ?? current.customCategories,
+            deletedSymbolIds: payload.symbolSettings?.deletedSymbolIds ?? current.deletedSymbolIds,
+            deletedCategoryIds: payload.symbolSettings?.deletedCategoryIds ?? current.deletedCategoryIds,
             symbolLabelOverrides:
               payload.symbolSettings?.symbolLabelOverrides ?? current.symbolLabelOverrides,
             childGender: payload.symbolSettings?.childGender ?? current.childGender,
@@ -1395,6 +1521,8 @@ export function SmartAACDemo() {
               enabledCategoryIds: state.enabledCategoryIds,
               customSymbols: state.customSymbols,
               customCategories: state.customCategories,
+              deletedSymbolIds: state.deletedSymbolIds ?? [],
+              deletedCategoryIds: state.deletedCategoryIds ?? [],
               symbolLabelOverrides: state.symbolLabelOverrides,
               childGender: state.childGender,
               smartGrammar: state.smartGrammar,
@@ -1475,6 +1603,8 @@ export function SmartAACDemo() {
             "enabledCategoryIds",
             "customSymbols",
             "customCategories",
+            "deletedSymbolIds",
+            "deletedCategoryIds",
             "symbolLabelOverrides",
             "childGender",
             "smartGrammar",
@@ -1568,6 +1698,8 @@ export function SmartAACDemo() {
           enabledCategoryIds: state.enabledCategoryIds,
           customSymbols: state.customSymbols,
           customCategories: state.customCategories,
+          deletedSymbolIds: state.deletedSymbolIds ?? [],
+          deletedCategoryIds: state.deletedCategoryIds ?? [],
           symbolLabelOverrides: state.symbolLabelOverrides,
           childGender: state.childGender,
           smartGrammar: state.smartGrammar,
@@ -1588,6 +1720,8 @@ export function SmartAACDemo() {
     state.enabledCategoryIds,
     state.customSymbols,
     state.customCategories,
+    state.deletedSymbolIds,
+    state.deletedCategoryIds,
     state.symbolLabelOverrides,
     state.childGender,
     state.smartGrammar,
@@ -1717,15 +1851,21 @@ export function SmartAACDemo() {
     () => getEventsThisWeek({ ...state, events: [...state.events, ...holidayEvents] }),
     [state, holidayEvents],
   );
-  const allSymbols = useMemo(
-    () =>
-      [...symbols, ...state.customSymbols].map((symbol) => ({
+  const allSymbols = useMemo(() => {
+    const deletedSymbols = new Set(state.deletedSymbolIds ?? []);
+    const deletedCategories = new Set(state.deletedCategoryIds ?? []);
+    return [...symbols, ...state.customSymbols]
+      .filter((symbol) => !deletedSymbols.has(symbol.id) && !deletedCategories.has(symbol.categoryId))
+      .map((symbol) => ({
         ...symbol,
         label: state.symbolLabelOverrides[symbol.id] ?? symbol.label,
-      })),
-    [state.customSymbols, state.symbolLabelOverrides],
+      }));
+  }, [state.customSymbols, state.symbolLabelOverrides, state.deletedSymbolIds, state.deletedCategoryIds]);
+  const allCategories = useMemo(
+    () => getAllCategories(state).filter((category) => !(state.deletedCategoryIds ?? []).includes(category.id)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.customCategories, state.deletedCategoryIds],
   );
-  const allCategories = useMemo(() => getAllCategories(state), [state.customCategories]);
   const allSymbolById = useMemo(
     () => Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])),
     [allSymbols],
@@ -1739,7 +1879,15 @@ export function SmartAACDemo() {
   };
 
   const childGender = state.childGender ?? "boy";
+  // Emoji of words tapped outside the board (event / daily words), shown in
+  // the sentence until (or instead of) a pictogram.
+  const [typedEmoji, setTypedEmoji] = useState<Record<string, string>>({});
   const smartGrammarOn = state.smartGrammar !== false;
+
+  // "מה עשיתי היום" is loaded in the background, so it opens at once.
+  useEffect(() => {
+    if (state.isRegisteredInSupabase && state.supabaseChildId) prefetchDailyStory(state.supabaseChildId);
+  }, [state.isRegisteredInSupabase, state.supabaseChildId]);
 
   const sentenceWords = (tokens: string[]): string[] =>
     tokens.map((token) => sentenceItemLabel(token, allSymbolById)).filter(Boolean);
@@ -1787,16 +1935,6 @@ export function SmartAACDemo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sentence, smartGrammarOn, childGender]);
 
-  const currentSentenceKey = sentenceWords(sentence).join(" ");
-  // Only show the corrected line when it actually changed a word — a fix
-  // that just adds a period or comma isn't worth the child's attention.
-  const withoutPunctuation = (text: string): string => text.replace(/[.,!?״"׳']/g, "").trim();
-  const visibleFixedSentence =
-    fixedSentence &&
-    fixedSentence.key === currentSentenceKey &&
-    withoutPunctuation(fixedSentence.text) !== withoutPunctuation(currentSentenceKey)
-      ? fixedSentence.text
-      : null;
 
   const addSymbol = (symbolId: string): void => {
     const symbol = allSymbolById[symbolId];
@@ -1826,9 +1964,19 @@ export function SmartAACDemo() {
 
   // A typed word that is on the board becomes that symbol (with its picture);
   // any other word gets a picture looked up on ARASAAC.
-  const addTypedText = (text: string): boolean => {
+  // `picture`: what the tapped word already shows (an ARASAAC pictogram or an
+  // emoji), so the sentence at the top shows it at once.
+  const addTypedText = (text: string, picture?: { pictogramId?: number; emoji?: string }): boolean => {
     const trimmed = sanitizeTypedText(text);
     if (!trimmed) return false;
+    const pictureKey = trimmed.replace(/[?!.,]+$/, "");
+    if (picture?.emoji) setTypedEmoji((current) => ({ ...current, [pictureKey]: picture.emoji as string }));
+    if (picture?.pictogramId) {
+      updateState((current) => ({
+        ...current,
+        typedPictograms: { ...(current.typedPictograms ?? {}), [pictureKey]: picture.pictogramId as number },
+      }));
+    }
 
     const byLabel = new Map(allSymbols.map((symbol) => [symbol.label, symbol.id]));
     const tokens = trimmed.split(" ").filter(Boolean).map((word) => {
@@ -1841,7 +1989,7 @@ export function SmartAACDemo() {
 
     tokens.filter(isTypedToken).forEach((token) => {
       const word = typedTokenLabel(token).replace(/[?!.,]+$/, "");
-      if (state.typedPictograms?.[word] !== undefined) return;
+      if (state.typedPictograms?.[word] !== undefined || (word === pictureKey && picture?.pictogramId)) return;
       void fetch(`https://api.arasaac.org/v1/pictograms/he/search/${encodeURIComponent(word)}`, {
         signal: AbortSignal.timeout(8000),
       })
@@ -2420,69 +2568,69 @@ export function SmartAACDemo() {
 
   if (isEntryOpen) {
     return (
-      <main className="min-h-screen overflow-auto bg-[radial-gradient(circle_at_top_left,_#ffffff_0,_transparent_34%),linear-gradient(135deg,_#eef5fb,_#f9fbff)] p-5">
-        <section className="mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-6xl flex-col justify-center">
-          <div className="mb-8 rounded-[2rem] border border-white/80 bg-white/80 p-6 shadow-soft backdrop-blur md:p-10">
-            <div className="mb-4 inline-flex rounded-full bg-blue-50 px-4 py-2 text-sm font-black text-blue-700">
-              SmartAAC · תקשורת תומכת
+      <main className="min-h-screen overflow-auto bg-[radial-gradient(circle_at_top_right,_#e0e7ff_0,_transparent_40%),radial-gradient(circle_at_bottom_left,_#d1fae5_0,_transparent_40%),linear-gradient(135deg,_#f5f8ff,_#fbfcff)] p-5 font-rubik">
+        <section className="mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-5xl flex-col justify-center">
+          <div className="mb-8 text-center">
+            <div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-[1.75rem] bg-gradient-to-br from-blue-500 to-violet-500 text-4xl shadow-soft">
+              💬
             </div>
-            <h1 className="max-w-3xl text-4xl font-black leading-tight md:text-6xl">
-              מערכת לילד המיוחד
+            <div className="mb-4 inline-flex rounded-full bg-white/80 px-4 py-1.5 text-sm font-bold text-blue-700 shadow-sm ring-1 ring-blue-100">
+              SmartAAC · תקשורת תומכת וחליפית (תת״ח)
+            </div>
+            <h1 className="mx-auto max-w-3xl bg-gradient-to-l from-blue-700 via-indigo-600 to-violet-600 bg-clip-text text-3xl font-bold leading-snug tracking-tight text-transparent md:text-5xl md:leading-snug">
+              מערכת להעשרת השפה והתקשורת לילדים עם צרכים מיוחדים
             </h1>
-            <p className="mt-4 max-w-3xl text-lg leading-8 text-muted">
-              עם לוח בקרה להורה ולמטפל
-            </p>
           </div>
 
-          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-            {savedSession && (
-              <button
-                type="button"
-                className="group flex h-full flex-col rounded-[2rem] border border-violet-100 bg-violet-50 p-7 text-right shadow-soft transition hover:-translate-y-1 md:col-span-2"
-                onClick={continueSavedSession}
-              >
-                <span className="block text-4xl">🔓</span>
-                <span className="mt-4 block text-2xl font-black">
-                  שלום {savedSession.name}, המשיכ/י ללוח הבקרה
-                </span>
-                <span className="mt-2 block text-muted" dir="ltr">
-                  {savedSession.email} · {savedSession.role === "teacher" ? "מורה" : "הורה"}
-                </span>
-                <span className="mt-4 inline-flex rounded-full bg-violet-200 px-5 py-3 font-black text-violet-900">
-                  כניסה מהירה — הסיסמה נשמרה
-                </span>
-              </button>
-            )}
-
+          {savedSession && (
             <button
               type="button"
-              className="group flex h-full flex-col rounded-[2rem] border border-emerald-100 bg-white p-7 text-right shadow-soft transition hover:-translate-y-1 hover:bg-emerald-50"
+              className="mx-auto mb-5 flex w-full max-w-3xl items-center gap-4 rounded-[1.75rem] bg-white/90 p-5 text-right shadow-soft ring-1 ring-violet-100 transition hover:-translate-y-0.5"
+              onClick={continueSavedSession}
+            >
+              <span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-violet-100 text-3xl">🔓</span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-xl font-bold">שלום {savedSession.name}, להמשיך ללוח הבקרה?</span>
+                <span className="mt-0.5 block truncate text-sm text-muted">
+                  <span dir="ltr">{savedSession.email}</span> · {savedSession.role === "teacher" ? "מורה" : "הורה"}
+                </span>
+              </span>
+              <span className="shrink-0 rounded-full bg-violet-600 px-5 py-2.5 font-bold text-white">כניסה מהירה ←</span>
+            </button>
+          )}
+
+          <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-5 md:grid-cols-2">
+            <button
+              type="button"
+              className="group flex h-full flex-col items-center rounded-[2rem] bg-white/90 p-8 text-center shadow-soft ring-1 ring-emerald-100 transition hover:-translate-y-1"
               onClick={() => {
                 setIsEntryOpen(false);
                 setChildView({ type: "home" });
               }}
             >
-              <span className="block text-6xl">🧒</span>
-              <span className="mt-5 block text-3xl font-black">כניסת ילד</span>
-              <span className="mt-3 block text-lg leading-8 text-muted">
-                פתיחה ישירה למסך התקשורת: סמלי ליבה, קטגוריות, משפטים מוכנים והקראה קולית.
+              <span className="grid h-24 w-24 place-items-center rounded-full bg-gradient-to-br from-emerald-100 to-teal-200 text-6xl transition group-hover:scale-105">
+                🧒
               </span>
-              <span className="mt-6 inline-flex rounded-full bg-emerald-100 px-5 py-3 font-black text-emerald-800">
-                פתחו את לוח התקשורת
+              <span className="mt-5 block text-2xl font-bold">כניסת ילד/ה</span>
+              <span className="mt-2 block leading-7 text-muted">לוח התקשורת בסמלים, שמקריא בקול כל משפט שבונים.</span>
+              <span className="mt-6 inline-flex rounded-full bg-gradient-to-l from-emerald-500 to-teal-500 px-6 py-3 font-bold text-white shadow-sm">
+                פתיחת לוח התקשורת
               </span>
             </button>
 
             <button
               type="button"
-              className="group flex h-full flex-col rounded-[2rem] border border-blue-100 bg-white p-7 text-right shadow-soft transition hover:-translate-y-1 hover:bg-blue-50"
+              className="group flex h-full flex-col items-center rounded-[2rem] bg-white/90 p-8 text-center shadow-soft ring-1 ring-blue-100 transition hover:-translate-y-1"
               onClick={() => setIsLoginOpen(true)}
             >
-              <span className="block text-6xl">👩‍👧</span>
-              <span className="mt-5 block text-3xl font-black">כניסת הורה / מטפל</span>
-              <span className="mt-3 block text-lg leading-8 text-muted">
-                ניהול אירועים, לוח שנה, נושא שבועי, רמת תפקוד, סמלים ומעקב התקדמות.
+              <span className="grid h-24 w-24 place-items-center rounded-full bg-gradient-to-br from-blue-100 to-indigo-200 text-6xl transition group-hover:scale-105">
+                👩‍👧
               </span>
-              <span className="mt-6 inline-flex rounded-full bg-blue-100 px-5 py-3 font-black text-blue-800">
+              <span className="mt-5 block text-2xl font-bold">כניסת הורה / מורה</span>
+              <span className="mt-2 block leading-7 text-muted">
+                אירועים, נושא שבועי, תמונות מהיום, סמלים, הדפסה ומעקב התקדמות.
+              </span>
+              <span className="mt-6 inline-flex rounded-full bg-gradient-to-l from-blue-600 to-indigo-600 px-6 py-3 font-bold text-white shadow-sm">
                 כניסה עם סיסמה
               </span>
             </button>
@@ -2597,7 +2745,9 @@ export function SmartAACDemo() {
                       )}
                     />
                   ) : (
-                    <span className="block text-2xl">{symbol?.emoji ?? "⌨️"}</span>
+                    <span className="block text-2xl">
+                      {symbol?.emoji ?? typedEmoji[label.replace(/[?!.,]+$/, "")] ?? "⌨️"}
+                    </span>
                   )}
                   <span className="block text-xs text-muted">{label}</span>
                 </span>
@@ -2659,6 +2809,16 @@ export function SmartAACDemo() {
         </button>
         <button
           type="button"
+          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-amber-300 text-center font-black text-amber-950 shadow-sm"
+          onClick={() => setChildView({ type: "daily" })}
+          aria-label="מה עשיתי היום"
+          title="מה עשיתי היום — בבית ובבית הספר"
+        >
+          <span className="block text-2xl">📸</span>
+          <span className="block text-xs leading-tight">מה עשיתי היום</span>
+        </button>
+        <button
+          type="button"
           className="grid min-h-20 w-24 shrink-0 place-items-center rounded-2xl border-2 border-slate-300 bg-white px-1 text-center font-black text-slate-700 shadow-sm"
           onClick={() => {
             // On the child's own device the parent PIN guards the dashboard;
@@ -2678,24 +2838,6 @@ export function SmartAACDemo() {
           <span className="block text-[11px] leading-tight">מסך הורה / מורה</span>
         </button>
       </header>
-
-      {smartGrammarOn && (visibleFixedSentence || (isFixingSentence && sentence.length > 1)) && (
-        <div className="mx-auto flex w-full max-w-7xl items-center gap-3 border-x border-white bg-violet-50/95 px-5 py-2 shadow-sm">
-          <span className="text-xl">✨</span>
-          {visibleFixedSentence ? (
-            <button
-              type="button"
-              className="text-right text-xl font-black text-violet-950"
-              onClick={() => speakText(visibleFixedSentence)}
-              title="השמע את המשפט המתוקן"
-            >
-              {visibleFixedSentence}
-            </button>
-          ) : (
-            <span className="text-sm font-bold text-violet-700">מסדר/ת את המשפט…</span>
-          )}
-        </div>
-      )}
 
       <section className="mx-auto flex w-full max-w-7xl flex-1 min-h-0 flex-col overflow-hidden rounded-b-[2rem] border-x border-b border-white bg-white/55 p-3 shadow-soft backdrop-blur sm:p-4">
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
@@ -2745,7 +2887,7 @@ export function SmartAACDemo() {
             allSymbols={allSymbols.filter((symbol) => !state.hiddenSymbolIds.includes(symbol.id))}
             symbolImages={state.symbolImages}
             onSymbolClick={addSymbol}
-            onWordClick={(word) => void addTypedText(word)}
+            onWordClick={(word, picture) => void addTypedText(word, picture)}
             childGender={childGender}
             onBack={() => setChildView({ type: "home" })}
             onPhraseClick={(phrase) => speakText(phrase)}
@@ -2758,6 +2900,18 @@ export function SmartAACDemo() {
             onSpeak={speakText}
             speechRate={state.speechRate}
             childGender={childGender}
+          />
+        )}
+
+        {childView.type === "daily" && (
+          <ChildDailyStoryView
+            childId={state.isRegisteredInSupabase ? state.supabaseChildId : undefined}
+            symbolById={allSymbolById}
+            symbolImages={state.symbolImages}
+            onBack={() => setChildView({ type: "home" })}
+            onSpeak={(text) => speakText(text)}
+            onSymbolClick={addSymbol}
+            onWordClick={(word, picture) => void addTypedText(word, picture)}
           />
         )}
 
@@ -3134,6 +3288,7 @@ function getKeshetRowSymbols(
 function KeshetRow({
   label,
   emoji,
+  pictogramId,
   labelClassName,
   symbols,
   symbolImages,
@@ -3146,6 +3301,7 @@ function KeshetRow({
 }: {
   label: string;
   emoji: string;
+  pictogramId?: number;
   labelClassName: string;
   symbols: AacSymbol[];
   symbolImages: Record<string, string>;
@@ -3166,7 +3322,11 @@ function KeshetRow({
           labelClassName,
         )}
       >
-        <span className="text-xl leading-none sm:text-2xl">{emoji}</span>
+        {pictogramId ? (
+          <img src={arasaacImageUrl(pictogramId)} alt="" className="h-7 w-7 object-contain sm:h-8 sm:w-8" />
+        ) : (
+          <span className="text-xl leading-none sm:text-2xl">{emoji}</span>
+        )}
         <span className="mt-1 text-xs leading-tight sm:text-sm">{label}</span>
       </div>
       <div className="flex min-w-0 flex-1 gap-1.5">
@@ -3226,7 +3386,7 @@ function KeshetHomeView({
   level: FunctionalityLevel;
   coreSymbolIds: string[];
   enabledCategoryIds: string[];
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
   allSymbols: AacSymbol[];
   favoriteSymbolIds: string[];
   symbolImages: Record<string, string>;
@@ -3284,6 +3444,7 @@ function KeshetHomeView({
             key={categoryId}
             label={category.label}
             emoji={category.emoji}
+            pictogramId={category.pictogramId}
             labelClassName={keshetLabelStyles[categoryId] ?? customCategoryLabelColor(categoryId)}
             symbols={rowSymbols}
             symbolImages={symbolImages}
@@ -3310,7 +3471,7 @@ function HomeView({
 }: {
   level: FunctionalityLevel;
   enabledCategoryIds: string[];
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
   usefulSymbols: AacSymbol[];
   symbolImages: Record<string, string>;
   onPhraseClick: (phrase: (typeof quickPhrases)[number]) => void;
@@ -3399,7 +3560,7 @@ function CategoryView({
   onSymbolClick,
 }: {
   categoryId: string;
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
   symbols: AacSymbol[];
   symbolImages: Record<string, string>;
   tileSize: string;
@@ -3419,7 +3580,7 @@ function CategoryView({
           חזרה
         </button>
         <h2 className="text-2xl font-black text-slate-950">
-          {category?.emoji} {category?.label}
+          <CategoryIcon category={category} size="h-9 w-9" /> {category?.label}
         </h2>
       </div>
 
@@ -3727,7 +3888,7 @@ function ChildEventsView({
   topicSymbols: AacSymbol[];
   symbolImages: Record<string, string>;
   onSymbolClick: (symbolId: string) => void;
-  onWordClick: (word: string) => void;
+  onWordClick: (word: string, picture?: { pictogramId?: number; emoji?: string }) => void;
   onBack: () => void;
   onPhraseClick: (phrase: string) => void;
 }) {
@@ -3920,7 +4081,7 @@ function ChildEventsView({
                     key={`${event.id}-word-${word.label}`}
                     type="button"
                     className="rounded-xl border-2 border-slate-300 bg-white p-2 text-center shadow-soft ring-1 ring-slate-900/5 transition active:scale-95"
-                    onClick={() => onWordClick(word.label)}
+                    onClick={() => onWordClick(word.label, { emoji: word.emoji })}
                   >
                     <span className="block text-3xl leading-none md:text-4xl">{word.emoji}</span>
                     <span className="mt-1.5 block text-sm font-black leading-4 text-slate-950 md:text-base">
@@ -3997,6 +4158,8 @@ function StoryGameView({
   const [feedback, setFeedback] = useState("");
   const [isLoadingNext, setIsLoadingNext] = useState(false);
   const [playedTitles, setPlayedTitles] = useState<string[]>([]);
+  // The story starts only when the child taps "start".
+  const [started, setStarted] = useState(false);
 
   const playStep = (index: number, current: Story): void => {
     const step = current.steps[index];
@@ -4040,11 +4203,6 @@ function StoryGameView({
     onSpeak(next.title, () => playStep(0, next));
   };
 
-  useEffect(() => {
-    const timeout = window.setTimeout(() => startStory(story), 400);
-    return () => window.clearTimeout(timeout);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const handlePick = (choice: StoryChoice): void => {
     if (narrating || finished || stepAnswered) return;
@@ -4101,6 +4259,21 @@ function StoryGameView({
         </div>
       </div>
 
+      {!started ? (
+        <div className="grid flex-1 place-items-center">
+          <button
+            type="button"
+            className="flex flex-col items-center gap-3 rounded-[2rem] bg-gradient-to-br from-rose-400 to-orange-400 px-16 py-10 text-white shadow-soft transition active:scale-95"
+            onClick={() => {
+              setStarted(true);
+              startStory(story);
+            }}
+          >
+            <span className="text-7xl">▶️</span>
+            <span className="text-3xl font-black">מתחילים סיפור</span>
+          </button>
+        </div>
+      ) : (
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="mb-6 rounded-soft border border-slate-200 bg-white p-5">
           <h3 className="mb-3 text-2xl font-black">
@@ -4164,6 +4337,7 @@ function StoryGameView({
           </>
         )}
       </div>
+      )}
     </div>
   );
 }
@@ -4801,11 +4975,27 @@ function SymbolTile({
   );
 }
 
+// A category's pictogram when one was chosen, otherwise its emoji.
+function CategoryIcon({
+  category,
+  size = "h-6 w-6",
+}: {
+  category?: { emoji: string; pictogramId?: number };
+  size?: string;
+}) {
+  if (!category) return null;
+  return category.pictogramId ? (
+    <img src={arasaacImageUrl(category.pictogramId)} alt="" className={cx("inline-block object-contain align-middle", size)} />
+  ) : (
+    <>{category.emoji}</>
+  );
+}
+
 function CategoryTile({
   category,
   onClick,
 }: {
-  category: { id: string; label: string; emoji: string };
+  category: { id: string; label: string; emoji: string; pictogramId?: number };
   onClick: () => void;
 }) {
   return (
@@ -4817,7 +5007,11 @@ function CategoryTile({
       )}
       onClick={onClick}
     >
-      <span className="block text-3xl">{category.emoji}</span>
+      {category.pictogramId ? (
+        <img src={arasaacImageUrl(category.pictogramId)} alt="" className="mx-auto h-9 w-9 object-contain" />
+      ) : (
+        <span className="block text-3xl">{category.emoji}</span>
+      )}
       <span className="mt-1 block text-base font-black text-slate-950">{category.label}</span>
     </button>
   );
@@ -4917,7 +5111,7 @@ function Dashboard({
   state: DemoState;
   activeTopic: { id: string; label: string; emoji: string } | undefined;
   allSymbols: AacSymbol[];
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
   allSymbolById: Record<string, AacSymbol>;
   onViewChange: (view: DashboardView) => void;
   onStateChange: (state: DemoState) => void;
@@ -4950,9 +5144,9 @@ function Dashboard({
           combined.sentenceLengths.reduce((total, value) => total + value, 0) /
           combined.sentenceLengths.length
         ).toFixed(1);
-  const nextEvent = state.events
-    .filter((event) => new Date(event.date).getTime() >= new Date(today()).getTime())
-    .sort((left, right) => new Date(left.date).getTime() - new Date(right.date).getTime())[0];
+  const tomorrowDate = new Date();
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const eventsTomorrow = state.events.filter((event) => event.date === localIsoDate(tomorrowDate));
 
   const update = (updater: (current: DemoState) => DemoState): void => {
     onStateChange(updater(state));
@@ -4968,6 +5162,8 @@ function Dashboard({
           ["topic", "📚", "נושא שבועי"],
           ["level", "🎚️", "רמת תפקוד"],
           ["symbols", "🔣", "סמלים"],
+          ["daily", "📸", "מה עשינו היום"],
+          ["print", "🖨️", "הדפסת סמלים"],
           ["library", "🌍", "ספרייה משותפת"],
           ["progress", "📈", "התקדמות"],
         ].map(([id, emoji, label]) => (
@@ -4986,7 +5182,7 @@ function Dashboard({
         ))}
         <div className="flex-1" />
         <button type="button" className="rounded-2xl bg-blue-500 px-4 py-3 font-black text-white" onClick={onClose}>
-          חזרה למסך הילד
+          🏠 חזרה לדף הבית
         </button>
         <p className="px-2 text-[10px] leading-4 text-muted">
           סמלי התקשורת: ARASAAC (arasaac.org), מאת Sergio Palao, בבעלות ממשלת
@@ -4996,63 +5192,44 @@ function Dashboard({
 
       <section className="flex-1 overflow-auto p-8">
         {view === "overview" && (
-          <section>
-            <h1 className="text-3xl font-black">סקירה</h1>
-            <p className="mb-6 text-muted">לוח בקרה</p>
-            <ChildDevicePanel
-              enabled={isChildDevice}
-              childName={state.activeChildName}
-              onChange={onChildDeviceChange}
-            />
-            <div className="mb-6 flex flex-wrap items-center gap-3 rounded-soft border border-violet-200 bg-white p-4 shadow-sm">
-              <span className="font-black">{state.activeChildName || "הילד/ה"} הוא/היא:</span>
-              {(
-                [
-                  ["boy", "👦 בן"],
-                  ["girl", "👧 בת"],
-                ] as const
-              ).map(([gender, label]) => (
-                <button
-                  key={gender}
-                  type="button"
-                  className={cx(
-                    "rounded-2xl border px-4 py-2 font-black",
-                    (state.childGender ?? "boy") === gender
-                      ? "border-violet-600 bg-violet-600 text-white"
-                      : "border-violet-200 bg-white text-violet-950",
-                  )}
-                  onClick={() => update((current) => ({ ...current, childGender: gender }))}
-                >
-                  {label}
-                </button>
-              ))}
-              <span className="text-sm text-muted">
-                המערכת תפנה לילד/ה ותקריא את המילים בלשון המתאימה.
-              </span>
-              <label className="mr-auto flex items-center gap-2 font-black">
-                <input
-                  type="checkbox"
-                  className="h-5 w-5"
-                  checked={state.smartGrammar !== false}
-                  onChange={(event) =>
-                    update((current) => ({ ...current, smartGrammar: event.target.checked }))
-                  }
-                />
-                ✨ תיקון משפטים חכם (AI)
-              </label>
+          <section className="font-rubik">
+            {/* hero: who the dashboard is about */}
+            <div className="relative mb-5 overflow-hidden rounded-[2rem] bg-gradient-to-l from-blue-600 via-indigo-600 to-violet-600 p-6 text-white shadow-soft">
+              <div className="absolute -left-10 -top-10 h-40 w-40 rounded-full bg-white/10" aria-hidden />
+              <div className="absolute -bottom-12 left-24 h-32 w-32 rounded-full bg-white/10" aria-hidden />
+              <div className="relative flex flex-wrap items-center gap-5">
+                <span className="grid h-20 w-20 place-items-center rounded-full bg-white/20 text-5xl shadow-inner">
+                  {state.childGender === "girl" ? "👧" : "👦"}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-blue-100">
+                    שלום {state.parentName || (state.dashboardRole === "teacher" ? "מורה" : "הורה")} ·{" "}
+                    {new Intl.DateTimeFormat("he-IL", { weekday: "long", day: "numeric", month: "long" }).format(new Date())}
+                  </p>
+                  <h1 className="mt-1 text-4xl font-extrabold tracking-tight">
+                    <span className="text-2xl font-medium text-blue-100">אחראית על </span>
+                    {state.activeChildName || "הילד/ה"}
+                  </h1>
+                </div>
+              </div>
             </div>
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              <Metric label="ילד/ה פעיל/ה" value={state.activeChildName || "לא הוגדר"} />
-              <Metric label="רמת תפקוד" value={levelLabels[state.level]} />
-              <Metric label="נושא שבועי" value={`${activeTopic?.emoji ?? ""} ${activeTopic?.label ?? "-"}`} />
-              <Metric label="משפטים שנבנו" value={String(combined.sentenceCount)} />
-            </div>
-            <div className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              <Metric label="סמלים פעילים" value={String(allSymbols.length - state.hiddenSymbolIds.length)} />
-            </div>
+
+            {eventsTomorrow.map((event) => (
+              <div
+                key={`reminder-${event.id}`}
+                className="mb-3 flex items-center gap-3 rounded-2xl border border-amber-200 bg-gradient-to-l from-amber-50 to-orange-50 p-4 font-medium text-amber-950 shadow-sm"
+              >
+                <span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-amber-200 text-2xl">🔔</span>
+                <strong className="font-bold">
+                  יש מחר {eventInfo(event).emoji} {event.title}
+                </strong>
+              </div>
+            ))}
+
             <div className="mt-6 grid gap-4 xl:grid-cols-2">
-              <div className="rounded-soft border border-blue-100 bg-blue-50 p-5 shadow-sm">
-                <h2 className="text-xl font-black">
+              <div className="rounded-[1.75rem] border border-blue-100 bg-white p-6 shadow-sm">
+                <h2 className="flex items-center gap-2 text-xl font-bold">
+                  <span className="grid h-9 w-9 place-items-center rounded-full bg-blue-100 text-lg">👥</span>
                   צוות הילד/ה — הורים ומורים
                 </h2>
                 {(
@@ -5065,18 +5242,6 @@ function Dashboard({
                       <span className="block text-sm font-black text-muted">אחראית על</span>
                       <span className="mt-1 block text-3xl font-black">{state.activeChildName || "—"}</span>
                     </div>
-                    <span
-                      className={cx(
-                        "mt-3 inline-flex rounded-full px-4 py-2 text-sm font-black",
-                        state.isRegisteredInSupabase
-                          ? "bg-emerald-100 text-emerald-800"
-                          : "bg-amber-100 text-amber-900",
-                      )}
-                    >
-                      {state.isRegisteredInSupabase
-                        ? "נשמר ב-Supabase"
-                        : "לא נשמר ב-Supabase (כניסה מקומית)"}
-                    </span>
                     <div
                       className={cx(
                         "mt-4 rounded-2xl p-4 shadow-sm",
@@ -5193,20 +5358,26 @@ function Dashboard({
                   </>
                 )}
               </div>
-              <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-                <h2 className="text-xl font-black">האירוע הקרוב</h2>
-                <p className="mt-2 text-muted">
-                  {nextEvent
-                    ? `${eventInfo(nextEvent).emoji} ${nextEvent.title} · ${nextEvent.date}`
-                    : "אין אירועים קרובים. אפשר להוסיף בלשונית אירועים."}
-                </p>
+              <div className="flex flex-col gap-4">
+                <div className="rounded-[1.75rem] bg-gradient-to-l from-violet-50 to-indigo-50 p-6 shadow-sm ring-1 ring-violet-100">
+                  <h2 className="flex items-center gap-2 text-xl font-bold">
+                    <span className="grid h-9 w-9 place-items-center rounded-full bg-white text-lg">💡</span>
+                    איך זה עובד?
+                  </h2>
+                  <p className="mt-2 leading-7 text-slate-700">
+                    ההורים והמורים מגדירים אירועים, נושא שבועי, תמונות ורמת תפקוד. הילד/ה רואה מסך תקשורת יציב,
+                    עם סמלים שמתאימים למה שקורה בחיים שלו/ה.
+                  </p>
+                </div>
               </div>
-              <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-                <h2 className="text-xl font-black">איך זה עובד?</h2>
-                <p className="mt-2 text-muted">
-                  ההורה מגדיר אירועים, נושא שבועי ורמת תפקוד. הילד רואה רק מסך תקשורת יציב עם הצעות עדינות.
-                </p>
-              </div>
+            </div>
+
+            <div className="mt-6">
+              <ChildDevicePanel
+                enabled={isChildDevice}
+                childName={state.activeChildName}
+                onChange={onChildDeviceChange}
+              />
             </div>
           </section>
         )}
@@ -5231,12 +5402,24 @@ function Dashboard({
           />
         )}
 
+        {view === "daily" && (
+          <DailyStoryDashboard state={state} allSymbols={allSymbols} preparePhoto={prepareFamilyPhoto} />
+        )}
+        {view === "print" && (
+          <PrintSymbolsDashboard
+            allSymbols={allSymbols}
+            allCategories={allCategories}
+            symbolImages={state.symbolImages}
+            hiddenSymbolIds={state.hiddenSymbolIds}
+          />
+        )}
         {view === "library" && (
           <SharedLibraryDashboard state={state} allSymbols={allSymbols} update={update} />
         )}
         {view === "progress" && (
           <ProgressDashboard
             state={combined}
+            activeSymbolCount={allSymbols.length - state.hiddenSymbolIds.length}
             activeTopic={activeTopic}
             averageLength={averageLength}
             allSymbolById={allSymbolById}
@@ -5245,6 +5428,45 @@ function Dashboard({
         )}
       </section>
     </main>
+  );
+}
+
+// Colorful number card (progress page).
+function StatCard({
+  icon,
+  label,
+  value,
+  tone,
+  hint,
+}: {
+  icon: string;
+  label: string;
+  value: string;
+  tone: string;
+  hint?: string;
+}) {
+  return (
+    <div className={cx("rounded-2xl bg-gradient-to-br px-4 py-3 shadow-sm ring-1 ring-black/5", tone)}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-bold opacity-80">{label}</span>
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/70 text-base">{icon}</span>
+      </div>
+      <div className="mt-1 text-2xl font-extrabold">{value}</div>
+      {hint && <div className="mt-1 text-xs font-medium opacity-70">{hint}</div>}
+    </div>
+  );
+}
+
+// A section card with an icon heading (progress page).
+function SectionCard({ icon, title, tint, children }: { icon: string; title: string; tint: string; children: ReactNode }) {
+  return (
+    <div className="rounded-[1.75rem] border border-slate-100 bg-white p-6 shadow-sm">
+      <h2 className="mb-4 flex items-center gap-2 text-xl font-bold">
+        <span className={cx("grid h-9 w-9 place-items-center rounded-full text-lg", tint)}>{icon}</span>
+        {title}
+      </h2>
+      {children}
+    </div>
   );
 }
 
@@ -5816,75 +6038,6 @@ function TopicDashboard({
   );
 }
 
-// "🔊 הקול": listen to the Hebrew voices on this device and pick the most
-// pleasant one. Saved on the device (voices differ between devices).
-function VoicePicker({ speechRate }: { speechRate: number }) {
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [chosen, setChosen] = useState("");
-
-  useEffect(() => {
-    setChosen(readChosenVoice());
-    const load = (): void => setVoices(hebrewVoicesOnDevice());
-    load();
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.addEventListener("voiceschanged", load);
-    return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
-  }, []);
-
-  const choose = (name: string): void => {
-    setChosen(name);
-    try {
-      if (name) window.localStorage.setItem(VOICE_KEY, name);
-      else window.localStorage.removeItem(VOICE_KEY);
-    } catch {
-      // not saved — still used for this sample
-    }
-    speakHebrew("שלום! אני רוצה לשחק עם אמא.", speechRate);
-  };
-
-  // "Microsoft הילה Online (Natural) - Hebrew (Israel)" → "הילה · טבעי"
-  const friendlyName = (voice: SpeechSynthesisVoice): string => {
-    const name = voice.name.replace(/microsoft|google|online|\(natural\)|- hebrew \(israel\)|hebrew|\(israel\)/gi, "").trim();
-    const natural = /natural/i.test(voice.name) ? " · טבעי וברור" : /google/i.test(voice.name) ? " · Google" : "";
-    return `${name || voice.name}${natural}`;
-  };
-
-  return (
-    <div className="mb-8 rounded-soft border border-sky-200 bg-sky-50 p-5 shadow-sm">
-      <h2 className="text-2xl font-black">🔊 הקול</h2>
-      <p className="mt-1 text-muted">לחצו על קול כדי לשמוע אותו ולבחור. הבחירה נשמרת במכשיר הזה.</p>
-      <div className="mt-4 flex flex-wrap gap-2">
-        <button
-          type="button"
-          className={cx(
-            "rounded-2xl border px-4 py-2 font-black",
-            chosen === "" ? "border-sky-600 bg-sky-600 text-white" : "border-sky-200 bg-white text-sky-950",
-          )}
-          onClick={() => choose("")}
-        >
-          ▶ אוטומטי (הקול הכי ברור)
-        </button>
-        {voices.map((voice) => (
-          <button
-            key={voice.name}
-            type="button"
-            className={cx(
-              "rounded-2xl border px-4 py-2 font-black",
-              chosen === voice.name ? "border-sky-600 bg-sky-600 text-white" : "border-sky-200 bg-white text-sky-950",
-            )}
-            onClick={() => choose(voice.name)}
-          >
-            ▶ {friendlyName(voice)}
-          </button>
-        ))}
-      </div>
-      {voices.length === 0 && (
-        <p className="mt-3 text-sm text-muted">לא נמצאו קולות בעברית בדפדפן הזה. מומלץ להשתמש ב-Edge.</p>
-      )}
-    </div>
-  );
-}
-
 function LevelDashboard({
   state,
   update,
@@ -5900,7 +6053,43 @@ function LevelDashboard({
 
   return (
     <section>
-      <VoicePicker speechRate={state.speechRate} />
+      <div className="mb-6 flex flex-wrap items-center gap-3 rounded-soft border border-violet-200 bg-white p-4 shadow-sm">
+        <span className="font-black">{state.activeChildName || "הילד/ה"} הוא/היא:</span>
+        {(
+          [
+            ["boy", "👦 בן"],
+            ["girl", "👧 בת"],
+          ] as const
+        ).map(([gender, label]) => (
+          <button
+            key={gender}
+            type="button"
+            className={cx(
+              "rounded-2xl border px-4 py-2 font-black",
+              (state.childGender ?? "boy") === gender
+                ? "border-violet-600 bg-violet-600 text-white"
+                : "border-violet-200 bg-white text-violet-950",
+            )}
+            onClick={() => update((current) => ({ ...current, childGender: gender }))}
+          >
+            {label}
+          </button>
+        ))}
+        <span className="text-sm text-muted">
+          המערכת תפנה לילד/ה ותקריא את המילים בלשון המתאימה.
+        </span>
+        <label className="mr-auto flex items-center gap-2 font-black">
+          <input
+            type="checkbox"
+            className="h-5 w-5"
+            checked={state.smartGrammar !== false}
+            onChange={(event) =>
+              update((current) => ({ ...current, smartGrammar: event.target.checked }))
+            }
+          />
+          ✨ תיקון משפטים חכם (AI)
+        </label>
+      </div>
 
       <h1 className="text-3xl font-black">רמת תפקוד</h1>
       <p className="mb-6 text-muted">הרמה נשלטת ידנית על ידי מטפל או הורה.</p>
@@ -6346,7 +6535,7 @@ function SymbolsDashboard({
 }: {
   state: DemoState;
   allSymbols: AacSymbol[];
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
   update: (updater: (current: DemoState) => DemoState) => void;
 }) {
   const [newSymbolLabel, setNewSymbolLabel] = useState("");
@@ -6355,6 +6544,8 @@ function SymbolsDashboard({
   const [newSymbolImage, setNewSymbolImage] = useState<string | undefined>(undefined);
   const [newCategoryLabel, setNewCategoryLabel] = useState("");
   const [newCategoryEmoji, setNewCategoryEmoji] = useState("📁");
+  const [newCategoryPictogram, setNewCategoryPictogram] = useState<number | undefined>(undefined);
+  const [newSymbolPictogram, setNewSymbolPictogram] = useState<number | undefined>(undefined);
   const [openCategoryIds, setOpenCategoryIds] = useState<string[]>([]);
   const [familyPhotoError, setFamilyPhotoError] = useState("");
   const [formError, setFormError] = useState("");
@@ -6390,6 +6581,59 @@ function SymbolsDashboard({
     } catch {
       setFamilyPhotoError("לא הצלחנו לטעון את התמונה.");
     }
+  };
+
+  // Only what the parent / teacher added can be deleted; built-in symbols can be hidden.
+  const forgetSymbols = (current: DemoState, ids: Set<string>): DemoState => {
+    const symbolImages = { ...current.symbolImages };
+    ids.forEach((id) => delete symbolImages[id]);
+    return {
+      ...current,
+      customSymbols: current.customSymbols.filter((symbol) => !ids.has(symbol.id)),
+      hiddenSymbolIds: current.hiddenSymbolIds.filter((id) => !ids.has(id)),
+      favoriteSymbolIds: current.favoriteSymbolIds.filter((id) => !ids.has(id)),
+      coreSymbolIds: current.coreSymbolIds.filter((id) => !ids.has(id)),
+      symbolImages,
+    };
+  };
+
+  const isCustomSymbol = (symbolId: string): boolean => state.customSymbols.some((item) => item.id === symbolId);
+
+  const deleteSymbol = (symbol: AacSymbol): void => {
+    if (!window.confirm(`למחוק את הסמל "${symbol.label}"?`)) return;
+    update((current) => {
+      const next = forgetSymbols(current, new Set([symbol.id]));
+      // A built-in symbol is only marked as deleted, so it can be restored.
+      return isCustomSymbol(symbol.id)
+        ? next
+        : { ...next, deletedSymbolIds: [...new Set([...(current.deletedSymbolIds ?? []), symbol.id])] };
+    });
+  };
+
+  const deletedCount = (state.deletedSymbolIds?.length ?? 0) + (state.deletedCategoryIds?.length ?? 0);
+  const restoreDeleted = (): void => {
+    update((current) => ({
+      ...current,
+      deletedSymbolIds: [],
+      deletedCategoryIds: [],
+      enabledCategoryIds: [...new Set([...current.enabledCategoryIds, ...(current.deletedCategoryIds ?? [])])],
+    }));
+  };
+
+  const deleteCategory = (category: { id: string; label: string }): void => {
+    const inside = allSymbols.filter((symbol) => symbol.categoryId === category.id);
+    const question = inside.length
+      ? `למחוק את הקטגוריה "${category.label}" ואת ${inside.length} הסמלים שבה?`
+      : `למחוק את הקטגוריה "${category.label}"?`;
+    if (!window.confirm(question)) return;
+    const isCustom = state.customCategories.some((item) => item.id === category.id);
+    update((current) => ({
+      ...forgetSymbols(current, new Set(inside.filter((symbol) => isCustomSymbol(symbol.id)).map((symbol) => symbol.id))),
+      customCategories: current.customCategories.filter((item) => item.id !== category.id),
+      enabledCategoryIds: current.enabledCategoryIds.filter((id) => id !== category.id),
+      ...(isCustom ? {} : { deletedCategoryIds: [...new Set([...(current.deletedCategoryIds ?? []), category.id])] }),
+    }));
+    if (newSymbolCategoryId === category.id) setNewSymbolCategoryId(allCategories[0]?.id ?? "feelings");
   };
 
   const toggleCategoryOpen = (categoryId: string): void => {
@@ -6440,9 +6684,12 @@ function SymbolsDashboard({
             placeholder="שם הקטגוריה, למשל: חיות"
           />
           <EmojiPickerField
-            label="אימוג׳י לקטגוריה"
+            label="סמל לקטגוריה"
             value={newCategoryEmoji}
             onChange={setNewCategoryEmoji}
+            pictogramId={newCategoryPictogram}
+            onPictogramChange={setNewCategoryPictogram}
+            suggestion={newCategoryLabel}
           />
           <button
             type="button"
@@ -6458,13 +6705,17 @@ function SymbolsDashboard({
               const categoryId = `custom-cat-${Date.now()}`;
               update((current) => ({
                 ...current,
-                customCategories: [...current.customCategories, { id: categoryId, label, emoji }],
+                customCategories: [
+                  ...current.customCategories,
+                  { id: categoryId, label, emoji, ...(newCategoryPictogram ? { pictogramId: newCategoryPictogram } : {}) },
+                ],
                 enabledCategoryIds: [...current.enabledCategoryIds, categoryId],
               }));
               setOpenCategoryIds((current) => [...current, categoryId]);
               setNewSymbolCategoryId(categoryId);
               setNewCategoryLabel("");
               setNewCategoryEmoji("📁");
+              setNewCategoryPictogram(undefined);
               setFormError("");
             }}
           >
@@ -6475,7 +6726,7 @@ function SymbolsDashboard({
 
       <div className="mb-8 rounded-soft border border-blue-100 bg-blue-50/70 p-5 shadow-sm">
         <h2 className="text-xl font-black">הוספת סמל חדש</h2>
-        <p className="mt-1 text-muted">הוסיפו מילה אישית עם אימוג׳י — היא תופיע גם במסך הילד.</p>
+        <p className="mt-1 text-muted">הוסיפו מילה אישית עם סמל או אימוג׳י — היא תופיע גם במסך הילד.</p>
         <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_minmax(280px,360px)_220px_auto] lg:items-end">
           <input
             className="rounded-2xl border border-slate-200 bg-white px-4 py-3"
@@ -6484,9 +6735,12 @@ function SymbolsDashboard({
             placeholder="שם הסמל, למשל: סבתא"
           />
           <EmojiPickerField
-            label="אימוג׳י לסמל"
+            label="סמל"
             value={newSymbolEmoji}
             onChange={setNewSymbolEmoji}
+            pictogramId={newSymbolPictogram}
+            onPictogramChange={setNewSymbolPictogram}
+            suggestion={newSymbolLabel}
           />
           <div>
             <label className="mb-2 block text-sm font-black text-slate-700">קטגוריה</label>
@@ -6582,6 +6836,7 @@ function SymbolsDashboard({
                 label,
                 emoji,
                 categoryId: newSymbolCategoryId,
+                ...(newSymbolPictogram ? { pictogramId: newSymbolPictogram } : {}),
               };
 
               update((current) => ({
@@ -6599,6 +6854,7 @@ function SymbolsDashboard({
               );
               setNewSymbolLabel("");
               setNewSymbolEmoji("⭐");
+              setNewSymbolPictogram(undefined);
               setNewSymbolImage(undefined);
               setFormError("");
             }}
@@ -6630,32 +6886,82 @@ function SymbolsDashboard({
             )}
             onClick={() => toggleListValue("enabledCategoryIds", category.id)}
           >
-            {category.emoji} {category.label}
+            <CategoryIcon category={category} /> {category.label}
           </button>
           );
         })}
       </div>
 
+      <div className="mb-4 grid gap-2 rounded-2xl border border-slate-200 bg-white p-4 text-sm leading-6 text-slate-700 sm:grid-cols-2">
+        <p>
+          <strong>★ מועדף</strong> — במסך הבית כל קטגוריה מראה רק חלק מהסמלים שלה. סמל מועדף תמיד יופיע שם, בלי
+          שצריך להיכנס לקטגוריה.
+        </p>
+        <p>
+          <strong>סמל ליבה</strong> — יופיע בשורת &quot;סמלי ליבה&quot; הקבועה, מילים שמשתמשים בהן כל הזמן (אני, רוצה,
+          עוד).
+        </p>
+        <p>
+          <strong>הסתר</strong> — הסמל לא יופיע אצל הילד/ה, ואפשר להחזיר אותו בכל רגע.
+        </p>
+        <p>
+          <strong>🗑️ מחיקה</strong> — מוחקת סמל או קטגוריה מהלוח. סמלים וקטגוריות שבאו עם המערכת אפשר תמיד
+          לשחזר.
+        </p>
+      </div>
+
+      {deletedCount > 0 && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
+          <span className="font-bold text-amber-950">
+            נמחקו {deletedCount} סמלים/קטגוריות שבאו עם המערכת.
+          </span>
+          <button
+            type="button"
+            className="rounded-2xl bg-white px-4 py-2 font-black text-amber-900 shadow-sm ring-1 ring-amber-200"
+            onClick={() => {
+              if (window.confirm("להחזיר את כל הסמלים והקטגוריות שנמחקו?")) restoreDeleted();
+            }}
+          >
+            ↩️ שחזור
+          </button>
+        </div>
+      )}
+
       <div className="space-y-4">
-        {allCategories.map((category) => {
+        {/* the categories the parent / teacher added come first */}
+        {[
+          ...allCategories.filter((category) => state.customCategories.some((item) => item.id === category.id)),
+          ...allCategories.filter((category) => !state.customCategories.some((item) => item.id === category.id)),
+        ].map((category) => {
           const isOpen = openCategoryIds.includes(category.id);
           const symbolCount = allSymbols.filter((symbol) => symbol.categoryId === category.id).length;
 
           return (
           <section key={category.id} className="rounded-soft border border-slate-200 bg-white shadow-sm">
-            <button
-              type="button"
-              className="flex w-full items-center justify-between gap-4 p-5 text-right"
-              onClick={() => toggleCategoryOpen(category.id)}
-            >
-              <span className="text-sm font-black text-slate-500">{isOpen ? "סגור" : "פתח"}</span>
-              <span className="flex flex-1 items-center justify-end gap-3">
-                <span className="text-sm text-muted">{symbolCount} סמלים</span>
-                <span className="text-xl font-black">
-                  {category.emoji} {category.label}
+            <div className="flex items-center gap-2 pl-5">
+              <button
+                type="button"
+                className="flex flex-1 items-center justify-between gap-4 p-5 text-right"
+                onClick={() => toggleCategoryOpen(category.id)}
+              >
+                <span className="text-sm font-black text-slate-500">{isOpen ? "סגור" : "פתח"}</span>
+                <span className="flex flex-1 items-center justify-end gap-3">
+                  <span className="text-sm text-muted">{symbolCount} סמלים</span>
+                  <span className="text-xl font-black">
+                    <CategoryIcon category={category} size="h-8 w-8" /> {category.label}
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+              {category.id !== "core" && (
+                <button
+                  type="button"
+                  className="shrink-0 rounded-2xl border border-red-200 bg-white px-4 py-2 text-sm font-black text-red-700"
+                  onClick={() => deleteCategory(category)}
+                >
+                  🗑️ מחיקת קטגוריה
+                </button>
+              )}
+            </div>
             {isOpen && (
             <div className="space-y-3 border-t border-slate-100 p-5 pt-4">
               {allSymbols
@@ -6688,8 +6994,9 @@ function SymbolsDashboard({
                       <div className="min-w-40 flex-1">
                         <div className="font-black">{symbol.label}</div>
                         <div className="text-sm text-muted">
-                          {isHidden ? "מוסתר" : "מוצג"} · {isFavorite ? "מועדף" : "לא מועדף"} ·{" "}
-                          {isCore ? "סמל בית" : "רגיל"}
+                          {isHidden ? "מוסתר מהילד/ה" : "מוצג לילד/ה"}
+                          {isFavorite ? " · ★ מועדף" : ""}
+                          {isCore ? " · סמל ליבה" : ""}
                         </div>
                       </div>
                       {category.id === "people" && (
@@ -6736,6 +7043,15 @@ function SymbolsDashboard({
                       >
                         סמל ליבה
                       </button>
+                      {(
+                        <button
+                          type="button"
+                          className="rounded-2xl border border-red-200 bg-white px-4 py-2 font-black text-red-700"
+                          onClick={() => deleteSymbol(symbol)}
+                        >
+                          🗑️ מחיקה
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -6751,16 +7067,18 @@ function SymbolsDashboard({
 
 function ProgressDashboard({
   state,
+  activeSymbolCount,
   activeTopic,
   averageLength,
   allSymbolById,
   allCategories,
 }: {
   state: DemoState;
+  activeSymbolCount: number;
   activeTopic: { id: string; label: string; emoji: string } | undefined;
   averageLength: string;
   allSymbolById: Record<string, AacSymbol>;
-  allCategories: Array<{ id: string; label: string; emoji: string }>;
+  allCategories: Array<{ id: string; label: string; emoji: string; pictogramId?: number }>;
 }) {
   const symbolUses = Object.values(state.usageBySymbolId).reduce((total, value) => total + value, 0);
   const topCategories = Object.entries(state.categoryUsageById)
@@ -6779,19 +7097,48 @@ function ProgressDashboard({
         ? "מתחילים לצבור שימוש"
         : "עדיין אין נתוני שימוש";
 
+  const maxCategory = Math.max(1, ...topCategories.map(([, count]) => count));
+  const maxSymbol = Math.max(1, ...topSymbols.map(([, count]) => count));
+
   return (
-    <section>
-      <h1 className="mb-6 text-3xl font-black">מעקב התקדמות</h1>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <Metric label="שימוש יומי" value={String(state.sentenceCount)} />
-        <Metric label="אורך משפט ממוצע" value={averageLength} />
-        <Metric label="שימושים בסמלים" value={String(symbolUses)} />
-        <Metric label="סמלים מנושא השבוע שנלחצו" value={String(activeTopicUsage)} />
+    <section className="font-rubik">
+      <div className="relative mb-6 overflow-hidden rounded-[2rem] bg-gradient-to-l from-emerald-500 via-teal-500 to-sky-500 p-6 text-white shadow-soft">
+        <div className="absolute -left-10 -top-10 h-40 w-40 rounded-full bg-white/10" aria-hidden />
+        <div className="relative">
+          <p className="text-sm font-medium text-emerald-50">מעקב התקדמות</p>
+          <h1 className="mt-1 text-4xl font-extrabold tracking-tight">📈 {trend}</h1>
+          <p className="mt-2 text-sm text-emerald-50">המגמה מבוססת על מספר המשפטים והשימוש בסמלים.</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+        <StatCard icon="💬" label="משפטים שנבנו" value={String(state.sentenceCount)} tone="from-sky-50 to-sky-100 text-sky-900" />
+        <StatCard
+          icon="📏"
+          label="אורך משפט ממוצע"
+          value={averageLength}
+          hint="מילים במשפט"
+          tone="from-indigo-50 to-indigo-100 text-indigo-900"
+        />
+        <StatCard icon="👆" label="שימושים בסמלים" value={String(symbolUses)} tone="from-violet-50 to-violet-100 text-violet-900" />
+        <StatCard
+          icon={activeTopic?.emoji ?? "📚"}
+          label="סמלים מנושא השבוע שנלחצו"
+          value={String(activeTopicUsage)}
+          hint={activeTopic ? `נושא: ${activeTopic.label}` : undefined}
+          tone="from-amber-50 to-amber-100 text-amber-900"
+        />
+        <StatCard icon="🔣" label="סמלים פעילים" value={String(activeSymbolCount)} tone="from-emerald-50 to-emerald-100 text-emerald-900" />
+        <StatCard
+          icon="📖"
+          label="סיפורים שהושלמו"
+          value={String((state.storyResults ?? []).filter((item) => !item.partial).length)}
+          tone="from-rose-50 to-rose-100 text-rose-900"
+        />
       </div>
 
       <div className="mt-6 grid gap-5 xl:grid-cols-2">
-        <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="mb-4 text-xl font-black">קטגוריות הכי בשימוש</h2>
+        <SectionCard icon="🗂️" title="קטגוריות הכי בשימוש" tint="bg-sky-100">
           {topCategories.length === 0 ? (
             <p className="text-muted">עדיין אין מספיק נתונים. נסו לבנות כמה משפטים במסך הילד.</p>
           ) : (
@@ -6799,20 +7146,27 @@ function ProgressDashboard({
               {topCategories.map(([categoryId, count]) => {
                 const category = allCategories.find((item) => item.id === categoryId);
                 return (
-                  <div key={categoryId} className="flex items-center justify-between rounded-2xl bg-slate-50 p-4">
-                    <span className="font-black">
-                      {category?.emoji} {category?.label ?? categoryId}
-                    </span>
-                    <span className="text-muted">{count}</span>
+                  <div key={categoryId}>
+                    <div className="mb-1 flex items-center justify-between text-sm">
+                      <span className="font-bold">
+                        <CategoryIcon category={category} size="h-5 w-5" /> {category?.label ?? categoryId}
+                      </span>
+                      <span className="font-bold text-slate-500">{count}</span>
+                    </div>
+                    <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className="h-full rounded-full bg-gradient-to-l from-sky-400 to-indigo-400"
+                        style={{ width: `${Math.round((count / maxCategory) * 100)}%` }}
+                      />
+                    </div>
                   </div>
                 );
               })}
             </div>
           )}
-        </div>
+        </SectionCard>
 
-        <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="mb-4 text-xl font-black">סמלים נפוצים</h2>
+        <SectionCard icon="⭐" title="סמלים נפוצים" tint="bg-amber-100">
           {topSymbols.length === 0 ? (
             <p className="text-muted">הסמלים הנפוצים יופיעו כאן אחרי שימוש.</p>
           ) : (
@@ -6820,32 +7174,36 @@ function ProgressDashboard({
               {topSymbols.map(([symbolId, count]) => {
                 const symbol = allSymbolById[symbolId];
                 return (
-                  <div key={symbolId} className="flex items-center gap-3 rounded-2xl bg-slate-50 p-4">
+                  <div key={symbolId} className="flex items-center gap-3">
                     {symbol?.pictogramId ? (
                       <img
                         src={arasaacImageUrl(symbol.pictogramId)}
                         alt={symbol.label}
-                        className="h-9 w-9 rounded-md object-cover"
+                        className="h-10 w-10 shrink-0 rounded-xl bg-slate-50 object-contain p-1"
                       />
                     ) : (
-                      <span className="text-2xl">{symbol?.emoji}</span>
+                      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-slate-50 text-2xl">
+                        {symbol?.emoji}
+                      </span>
                     )}
-                    <span className="flex-1 font-black">{symbol?.label ?? symbolId}</span>
-                    <span className="text-muted">{count}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-1 flex items-center justify-between text-sm">
+                        <span className="font-bold">{symbol?.label ?? symbolId}</span>
+                        <span className="font-bold text-slate-500">{count}</span>
+                      </div>
+                      <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-l from-amber-400 to-rose-400"
+                          style={{ width: `${Math.round((count / maxSymbol) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
                   </div>
                 );
               })}
             </div>
           )}
-        </div>
-      </div>
-
-      <div className="mt-5 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="text-sm font-black text-muted">מגמת שיפור</div>
-        <div className="mt-2 text-2xl font-black text-emerald-700">📈 {trend}</div>
-        <p className="mt-2 text-muted">
-          המגמה מבוססת על מספר משפטים ושימושים בסמלים.
-        </p>
+        </SectionCard>
       </div>
 
       <StoryProgress results={state.storyResults ?? []} />
@@ -6882,8 +7240,11 @@ function StoryProgress({ results }: { results: StoryResult[] }) {
   const formatDate = (date: string): string => date.split("-").reverse().join("/");
 
   return (
-    <div className="mt-5 rounded-soft border border-rose-200 bg-white p-5 shadow-sm">
-      <h2 className="text-xl font-black">📖 משחק הסיפור — התאמת מילה למשפט</h2>
+    <div className="mt-5 rounded-[1.75rem] border border-slate-100 bg-white p-6 shadow-sm">
+      <h2 className="flex items-center gap-2 text-xl font-bold">
+        <span className="grid h-9 w-9 place-items-center rounded-full bg-rose-100 text-lg">📖</span>
+        משחק הסיפור — התאמת מילה למשפט
+      </h2>
       {results.length === 0 ? (
         <p className="mt-2 text-muted">עוד לא שוחק סיפור. התוצאות יופיעו כאן אחרי הסיפור הראשון.</p>
       ) : (

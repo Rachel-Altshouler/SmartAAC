@@ -4,6 +4,8 @@ export type SymbolCategory = {
   id: string;
   label: string;
   emoji: string;
+  // ARASAAC pictogram chosen for a custom category (shown instead of the emoji).
+  pictogramId?: number;
 };
 
 // Fitzgerald-key-style grammatical coloring: pronoun/verb/question/noun/
@@ -81,6 +83,9 @@ export type DemoState = {
   weeklyTopicId: string;
   coreSymbolIds: string[];
   hiddenSymbolIds: string[];
+  // Built-in symbols / categories the parent or teacher deleted (restorable).
+  deletedSymbolIds?: string[];
+  deletedCategoryIds?: string[];
   favoriteSymbolIds: string[];
   enabledCategoryIds: string[];
   customSymbols: AacSymbol[];

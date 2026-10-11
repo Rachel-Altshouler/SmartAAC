@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { arasaacImageUrl, type AacSymbol, type DemoState } from "@/lib/demo-data";
+import { arasaacImageUrl, getAllCategories, type AacSymbol, type DemoState } from "@/lib/demo-data";
 import { SHARED_BOARD_TOPICS, type SharedBoard, type SharedSymbol } from "@/lib/shared-library";
 import { supabase } from "@/lib/supabase-browser";
 
@@ -79,6 +79,8 @@ export function SharedLibraryDashboard({
   const [isSharing, setIsSharing] = useState(false);
 
   const canUseLibrary = state.isRegisteredInSupabase && Boolean(supabase);
+  const normalizeTitle = (title: string): string => title.replace(/\s+/g, " ").trim();
+  const myCategoryTitles = new Set(getAllCategories(state).map((category) => normalizeTitle(category.label)));
 
   // Only the user's own categories can be shared, and only their words —
   // personal photos (state.symbolImages) are never sent.
@@ -302,6 +304,7 @@ export function SharedLibraryDashboard({
         {visibleBoards.map((board) => {
           const topic = topicById[board.topic] ?? topicById.other;
           const isAdded = addedBoardIds.includes(board.id);
+          const alreadyExists = !isAdded && myCategoryTitles.has(normalizeTitle(board.title));
           return (
             <article key={board.id} className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
               <div className="flex items-start gap-3">
@@ -344,11 +347,15 @@ export function SharedLibraryDashboard({
               <div className="mt-4 flex flex-wrap gap-2">
                 <button
                   type="button"
-                  disabled={isAdded}
+                  disabled={isAdded || alreadyExists}
                   className="rounded-2xl bg-emerald-600 px-5 py-2.5 font-black text-white disabled:bg-emerald-200 disabled:text-emerald-900"
                   onClick={() => addToMyChild(board)}
                 >
-                  {isAdded ? "✓ נוסף" : `➕ הוסף ל${state.activeChildName || "ילד/ה שלי"}`}
+                  {isAdded
+                    ? "✓ נוסף"
+                    : alreadyExists
+                      ? `✓ קיים אצל ${state.activeChildName || "הילד/ה"}`
+                      : `➕ הוסף ל${state.activeChildName || "ילד/ה שלי"}`}
                 </button>
                 {board.isMine && (
                   <button

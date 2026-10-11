@@ -8,6 +8,9 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        rubik: ["Rubik", "Assistant", "Segoe UI", "sans-serif"],
+      },
       colors: {
         ink: "#233043",
         muted: "#637083",
