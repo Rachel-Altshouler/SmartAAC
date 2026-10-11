@@ -72,8 +72,26 @@ const emailConfirmationBlockedMessage = (): string => {
   return "האימייל לא אושר. נסו שוב בעוד רגע.";
 };
 
+// A slow or filtered network (e.g. a content filter) sometimes drops the
+// connection to Supabase ("fetch failed"). Try again a couple of times before
+// giving up — only on network errors, never on a real answer from Supabase.
+const resilientFetch: typeof fetch = async (input, init) => {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await fetch(input, init);
+    } catch (error) {
+      lastError = error;
+      if (init?.signal?.aborted) break;
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+};
+
 export function createServerSupabaseClient(): SupabaseClient {
   return createClient(supabaseUrl as string, supabaseAnonKey as string, {
+    global: { fetch: resilientFetch },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -85,6 +103,7 @@ export function createAdminSupabaseClient(): SupabaseClient | null {
   if (!hasAdminAccess()) return null;
 
   return createClient(supabaseUrl as string, supabaseServiceRoleKey as string, {
+    global: { fetch: resilientFetch },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -156,7 +175,7 @@ export async function signInWithPassword(
     return { session: null, error: "Supabase is not configured" };
   }
 
-  const response = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
+  const response = await resilientFetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({ email, password }),
@@ -179,7 +198,7 @@ export async function signUpWithPassword(
     return { session: null, error: "Supabase is not configured" };
   }
 
-  const response = await fetch(`${supabaseUrl}/auth/v1/signup`, {
+  const response = await resilientFetch(`${supabaseUrl}/auth/v1/signup`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
@@ -268,6 +287,7 @@ export async function sessionFromTokens(
 export function createAuthedSupabaseClient(accessToken: string): SupabaseClient {
   return createClient(supabaseUrl as string, supabaseAnonKey as string, {
     global: {
+      fetch: resilientFetch,
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },

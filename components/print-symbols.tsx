@@ -149,7 +149,7 @@ export function PrintSymbolsDashboard({
             {(
               [
                 [1, "עותק אחד מכל סמל"],
-                [2, "זוגות (למשחק זיכרון)"],
+                [2, "שני עותקים מכל סמל (למשחק זיכרון)"],
               ] as const
             ).map(([value, label]) => (
               <button
