@@ -432,6 +432,11 @@ const resolveSymbolImage = (
 
 const MAX_FAMILY_PHOTO_BYTES = 8 * 1024 * 1024;
 
+// The child's own photo, shown on the name cell of the board. It rides with the
+// board's photos (child_app_state.symbol_images_json in Supabase), so whoever on
+// the care team uploads it, every device of the child gets it.
+const CHILD_PHOTO_KEY = "child-photo";
+
 const readImageFileAsDataUrl = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -3152,7 +3157,7 @@ function LoginModal({
                   dir="ltr"
                   value={childAccessCode}
                   onChange={(event) => onChildAccessCodeChange(event.target.value)}
-                  placeholder="AAC-1234"
+                  placeholder="הקלידו כאן את הקוד שקיבלתם"
                 />
               </label>
               <label className="grid gap-1">
@@ -3395,7 +3400,7 @@ function LoginModal({
                 dir="ltr"
                 value={childAccessCode}
                 onChange={(event) => onChildAccessCodeChange(event.target.value)}
-                placeholder="AAC-1234"
+                placeholder="הקלידו כאן את הקוד שקיבלתם"
               />
             </label>
           )}
@@ -3546,7 +3551,15 @@ function KeshetRow({
       <div className="flex min-w-0 flex-1 gap-1.5">
         {showNameCell && childName ? (
           <div className="flex min-w-[5rem] shrink-0 flex-col items-center justify-center rounded-xl border-[3px] border-slate-900 bg-violet-200 px-2 py-1 text-center font-black shadow-sm sm:min-w-[6rem]">
-            <span className="text-xs leading-tight text-violet-800 sm:text-sm">שם</span>
+            {symbolImages[CHILD_PHOTO_KEY] ? (
+              <img
+                src={symbolImages[CHILD_PHOTO_KEY]}
+                alt=""
+                className="mb-0.5 h-10 w-10 rounded-full border-2 border-white object-cover shadow-sm sm:h-12 sm:w-12"
+              />
+            ) : (
+              <span className="text-xs leading-tight text-violet-800 sm:text-sm">שם</span>
+            )}
             <span className="text-sm leading-tight sm:text-base">{childName}</span>
           </div>
         ) : null}
@@ -4579,6 +4592,9 @@ function VoiceAssistantView({
   const [answer, setAnswer] = useState(welcome);
   const [isRecording, setIsRecording] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
+  // The recording is on its way to text: shown on screen, so the wait doesn't
+  // look like nothing happened.
+  const [isTranscribing, setIsTranscribing] = useState(false);
   // Status notes ("מצב בסיסי…", mic problems) are not shown to the child —
   // they only go to the developer console.
   const setSpeechHint = (note: string): void => {
@@ -4607,6 +4623,8 @@ function VoiceAssistantView({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
+          // the child shouldn't wait in silence: past this, the browser voice speaks
+          signal: AbortSignal.timeout(5000),
         });
 
         if (response.ok) {
@@ -4625,12 +4643,11 @@ function VoiceAssistantView({
           }
         }
 
-        const data = (await response.json()) as { detail?: string; error?: string };
-        if (isOpenAiQuotaError(`${data.error ?? ""} ${data.detail ?? ""}`)) {
-          openAiSpeechBlockedRef.current = true;
-        }
+        // Out of credit or unreachable: the next replies go straight to the
+        // browser voice instead of waiting for the same failure.
+        openAiSpeechBlockedRef.current = true;
       } catch {
-        // fall through to browser speech
+        openAiSpeechBlockedRef.current = true;
       }
     }
 
@@ -4705,7 +4722,7 @@ function VoiceAssistantView({
         setSpeechHint("");
       }
       const nextAnswer =
-        data.answer?.trim() || buildLocalChildAiAnswer(cleanText, [...messages, userMessage]);
+        data.answer?.trim() || buildLocalChildAiAnswer(cleanText, [...messages, userMessage], childGender);
       const assistantMessage: AiChatMessage = {
         id: `assistant-${Date.now()}`,
         role: "assistant",
@@ -4716,7 +4733,7 @@ function VoiceAssistantView({
       setAnswer(nextAnswer);
       void speakReply(nextAnswer);
     } catch {
-      const fallback = buildLocalChildAiAnswer(cleanText, [...messages, userMessage]);
+      const fallback = buildLocalChildAiAnswer(cleanText, [...messages, userMessage], childGender);
       const assistantMessage: AiChatMessage = {
         id: `assistant-fallback-${Date.now()}`,
         role: "assistant",
@@ -4779,7 +4796,7 @@ function VoiceAssistantView({
   };
 
   const startRecording = async (): Promise<void> => {
-    if (isRecording || isThinking) return;
+    if (isRecording || isThinking || isTranscribing) return;
 
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setSpeechHint("הדפדפן לא תומך בהקלטת דיבור");
@@ -4872,6 +4889,7 @@ function VoiceAssistantView({
           return;
         }
 
+        setIsTranscribing(true);
         void (async () => {
           try {
             let uploadBlob: Blob = blob;
@@ -4922,6 +4940,8 @@ function VoiceAssistantView({
             setSpeechHint("בדק/י את הטקסט, תקנ/י אם צריך, ולחצ/י שלח.");
           } catch {
             setSpeechHint("שגיאה בשליחת הדיבור. נס/י לכתוב וללחוץ שלח.");
+          } finally {
+            setIsTranscribing(false);
           }
         })();
       };
@@ -4995,18 +5015,31 @@ function VoiceAssistantView({
           <label className="mb-2 block text-sm font-black text-muted">
             המשך שיחה
           </label>
-          <textarea
-            className="min-h-36 w-full rounded-2xl border border-slate-200 p-4 text-xl"
-            value={message}
-            onChange={(event) => setMessage(event.target.value)}
-            placeholder="אפשר לכתוב חופשי, למשל: אני עצובה היום"
-          />
+          <div className="relative">
+            <textarea
+              className="min-h-36 w-full rounded-2xl border border-slate-200 p-4 text-xl"
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder={isTranscribing ? "" : "אפשר לכתוב כאן או להקליט במיקרופון"}
+              disabled={isTranscribing}
+            />
+            {isTranscribing && (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-3 text-xl font-black text-slate-500">
+                <span>✍️ כותב את מה שאמרת</span>
+                <span className="flex gap-1">
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.3s]" />
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.15s]" />
+                  <span className="h-2.5 w-2.5 animate-bounce rounded-full bg-slate-400" />
+                </span>
+              </div>
+            )}
+          </div>
           <div className="mt-4 flex flex-wrap gap-3">
             <button
               type="button"
               className={cx("rounded-2xl px-6 py-4 text-lg font-black text-white shadow-soft disabled:opacity-60", isRecording ? "bg-red-500" : "bg-emerald-500")}
               onClick={toggleSpeech}
-              disabled={isThinking}
+              disabled={isThinking || isTranscribing}
             >
               {isRecording ? "⏹ סיום דיבור" : "🎤 התחלת דיבור"}
             </button>
@@ -5025,16 +5058,16 @@ function VoiceAssistantView({
             )}
             <button
               type="button"
-              className="rounded-2xl bg-blue-500 px-6 py-4 text-lg font-black text-white shadow-soft"
+              className="rounded-2xl bg-blue-500 px-6 py-4 text-lg font-black text-white shadow-soft disabled:opacity-60"
               onClick={() => {
                 void answerChild(message);
               }}
-              disabled={isThinking}
+              disabled={isThinking || isTranscribing}
             >
-              {isThinking ? "חושב..." : "שלח"}
+              {isThinking ? "🤔 חושב..." : "📤 שלח"}
             </button>
           </div>
-          <div className="mt-4 flex flex-wrap gap-2">
+          <div className="mt-4 flex gap-1.5">
             {[
               { text: "אני רוצה מים", symbolIds: ["i", "want", "water"] },
               { text: `אני ${genderWord("עייף", childGender)}`, symbolIds: ["i", "tired"] },
@@ -5045,14 +5078,14 @@ function VoiceAssistantView({
               <button
                 key={starter.text}
                 type="button"
-                className="flex flex-col items-center gap-1 rounded-2xl border-2 border-slate-200 bg-white px-3 py-2 shadow-sm transition active:scale-95"
+                className="flex min-w-0 flex-1 flex-col items-center gap-0.5 rounded-xl border-2 border-slate-200 bg-white px-1 py-1.5 shadow-sm transition active:scale-95"
                 onClick={() => {
                   setMessage(starter.text);
                   void answerChild(starter.text);
                 }}
                 aria-label={starter.text}
               >
-                <span className="flex items-end gap-1" aria-hidden>
+                <span className="flex items-end gap-0.5" aria-hidden>
                   {starter.symbolIds.map((symbolId) => {
                     const symbol = symbols.find((item) => item.id === symbolId);
                     return symbol?.pictogramId ? (
@@ -5060,16 +5093,16 @@ function VoiceAssistantView({
                         key={symbolId}
                         src={arasaacImageUrl(symbol.pictogramId)}
                         alt=""
-                        className="h-12 w-12 rounded-md object-contain"
+                        className="h-7 w-7 rounded object-contain sm:h-8 sm:w-8"
                       />
                     ) : (
-                      <span key={symbolId} className="text-4xl leading-[3rem]">
+                      <span key={symbolId} className="text-2xl leading-8">
                         {symbol?.emoji}
                       </span>
                     );
                   })}
                 </span>
-                <span className="text-xs font-bold text-slate-500">{starter.text}</span>
+                <span className="truncate text-[11px] font-bold text-slate-500">{starter.text}</span>
               </button>
             ))}
           </div>
@@ -5343,6 +5376,7 @@ function Dashboard({
   onClose: () => void;
 }) {
   const [codeMessage, setCodeMessage] = useState("");
+  const [childPhotoError, setChildPhotoError] = useState("");
   const [isRotatingCode, setIsRotatingCode] = useState(false);
   const [isSendingInvite, setIsSendingInvite] = useState(false);
   const [inviteeRole, setInviteeRole] = useState<"parent" | "teacher">(
@@ -5412,9 +5446,70 @@ function Dashboard({
               <div className="absolute -left-10 -top-10 h-40 w-40 rounded-full bg-white/10" aria-hidden />
               <div className="absolute -bottom-12 left-24 h-32 w-32 rounded-full bg-white/10" aria-hidden />
               <div className="relative flex flex-wrap items-center gap-5">
-                <span className="grid h-20 w-20 place-items-center rounded-full bg-white/20 text-5xl shadow-inner">
-                  {state.childGender === "girl" ? "👧" : "👦"}
-                </span>
+                <div className="flex flex-col items-center gap-1">
+                  <label
+                    className="relative grid h-20 w-20 cursor-pointer place-items-center rounded-full bg-white/20 text-5xl shadow-inner"
+                    title="העלאת תמונה של הילד/ה"
+                  >
+                    {state.symbolImages[CHILD_PHOTO_KEY] ? (
+                      <img
+                        src={state.symbolImages[CHILD_PHOTO_KEY]}
+                        alt={state.activeChildName || "הילד/ה"}
+                        className="h-20 w-20 rounded-full border-2 border-white object-cover"
+                      />
+                    ) : (
+                      <span>{state.childGender === "girl" ? "👧" : "👦"}</span>
+                    )}
+                    <span className="absolute -bottom-1 -left-1 grid h-8 w-8 place-items-center rounded-full bg-white text-base shadow">
+                      📷
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = "";
+                        if (!file) return;
+                        if (!file.type.startsWith("image/")) {
+                          setChildPhotoError("בחר/י קובץ תמונה בלבד.");
+                          return;
+                        }
+                        if (file.size > MAX_FAMILY_PHOTO_BYTES) {
+                          setChildPhotoError("התמונה גדולה מדי. עד 8MB.");
+                          return;
+                        }
+                        void prepareFamilyPhoto(file)
+                          .then((dataUrl) => {
+                            update((current) => ({
+                              ...current,
+                              symbolImages: { ...current.symbolImages, [CHILD_PHOTO_KEY]: dataUrl },
+                            }));
+                            setChildPhotoError("");
+                          })
+                          .catch(() => setChildPhotoError("לא הצלחנו לטעון את התמונה."));
+                      }}
+                    />
+                  </label>
+                  {state.symbolImages[CHILD_PHOTO_KEY] ? (
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-blue-100 underline"
+                      onClick={() =>
+                        update((current) => ({
+                          ...current,
+                          symbolImages: Object.fromEntries(
+                            Object.entries(current.symbolImages).filter(([key]) => key !== CHILD_PHOTO_KEY),
+                          ),
+                        }))
+                      }
+                    >
+                      הסרת תמונה
+                    </button>
+                  ) : (
+                    <span className="text-xs font-medium text-blue-100">הוספת תמונה</span>
+                  )}
+                </div>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium text-blue-100">
                     שלום {state.parentName || (state.dashboardRole === "teacher" ? "מורה" : "הורה")} ·{" "}
@@ -5424,6 +5519,11 @@ function Dashboard({
                     <span className="text-2xl font-medium text-blue-100">אחראית על </span>
                     {state.activeChildName || "הילד/ה"}
                   </h1>
+                  {childPhotoError && (
+                    <p className="mt-2 inline-block rounded-xl bg-white/90 px-3 py-1 text-sm font-bold text-red-700">
+                      {childPhotoError}
+                    </p>
+                  )}
                 </div>
               </div>
             </div>

@@ -75,6 +75,9 @@ export async function isOllamaWhisperAvailable(): Promise<boolean> {
 }
 
 export async function isOllamaAvailable(): Promise<boolean> {
+  // Ollama only ever runs on this machine (getOllamaBaseUrl allows localhost
+  // only), so on Vercel there is nothing to ask.
+  if (process.env.VERCEL) return false;
   try {
     const response = await fetch(`${getOllamaBaseUrl()}/api/tags`, {
       signal: AbortSignal.timeout(2000),

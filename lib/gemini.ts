@@ -7,12 +7,12 @@ const GEMINI_MODEL_FALLBACKS = [
 ] as const;
 
 export const CHILD_AI_SYSTEM_PROMPT = [
-  "אתה חבר שיחה חם, סבלני וטבעי לילד/ה המשתמש/ת ב-AAC.",
-  "דבר בעברית פשוטה וחמה, 2-4 משפטים קצרים.",
-  "המשך שיחה אמיתית: התייחס למה שנאמר עכשיו וגם לשיחה הקודמת.",
-  "אל תחזור על משפטים שכבר אמרת בשיחה. אל תחזור על אותה תבנית.",
-  "אם המשפט קצר או לא ברור — נחש בזהירות, שאל שאלה פתוחה אחת, או הצע 2-3 אפשרויות.",
-  "אל תיתן ייעוץ רפואי. היה מעודד, סבלני וזורם.",
+  "אתה חבר שיחה חם וסבלני של ילד צעיר שמתקשה לדבר ומשתמש בלוח תקשורת.",
+  "ענה בעברית תקינה ופשוטה מאוד, כמו שמדברים עם ילד בגן: 2-3 משפטים קצרים, מילים של יום-יום, בלי ניבים ובלי מילים גבוהות.",
+  "התייחס בדיוק למה שנאמר עכשיו. אל תמציא דברים, ואל תגיד שהילד סיפר לך משהו אם זה לא כתוב בשיחה.",
+  "סיים בשאלה אחת קצרה, או הצע 2-3 אפשרויות לבחירה. אם המשפט לא ברור, נחש בעדינות ושאל אם הבנת נכון.",
+  "אל תחזור על משפטים שכבר אמרת. בלי רשימות, בלי שורות ריקות ובלי צורות עם קו נטוי (כמו את/ה).",
+  "אל תיתן ייעוץ רפואי.",
 ].join(" ");
 
 type GeminiPart =
@@ -69,6 +69,7 @@ async function geminiGenerateWithModel(
     temperature?: number;
     maxOutputTokens?: number;
     thinkingBudget?: number;
+    timeoutMs?: number;
   },
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const apiKey = getGeminiApiKey();
@@ -98,7 +99,7 @@ async function geminiGenerateWithModel(
             : {}),
         },
       }),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(options?.timeoutMs ?? 20000),
     });
 
     const data = (await response.json()) as GeminiResponse;
@@ -126,6 +127,7 @@ async function geminiGenerate(
     temperature?: number;
     maxOutputTokens?: number;
     thinkingBudget?: number;
+    timeoutMs?: number;
     models?: string[];
   },
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
@@ -159,6 +161,7 @@ export async function geminiChat(options: {
   thinkingBudget?: number;
   maxOutputTokens?: number;
   temperature?: number;
+  timeoutMs?: number;
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const contents: GeminiContent[] = [
     ...options.history.map((item) => ({
@@ -173,6 +176,7 @@ export async function geminiChat(options: {
     temperature: options.temperature ?? 0.85,
     maxOutputTokens: options.maxOutputTokens ?? 320,
     thinkingBudget: options.thinkingBudget,
+    timeoutMs: options.timeoutMs,
     models: options.models,
   });
 }
@@ -213,6 +217,7 @@ export async function geminiTranscribeAudio(
         ],
       },
     ],
-    { temperature: 0, maxOutputTokens: 256 },
+    // Thinking off: a transcript needs none, and it was most of the wait.
+    { temperature: 0, maxOutputTokens: 256, thinkingBudget: 0 },
   );
 }

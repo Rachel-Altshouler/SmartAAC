@@ -42,6 +42,7 @@ export async function groqChat(options: {
   message: string;
   systemPrompt?: string;
   temperature?: number;
+  timeoutMs?: number;
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const apiKey = getGroqApiKey();
   if (!apiKey) {
@@ -68,7 +69,7 @@ export async function groqChat(options: {
         temperature: options.temperature ?? 0.85,
         max_tokens: 320,
       }),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(options.timeoutMs ?? 20000),
     });
 
     const raw = await response.text();
@@ -121,13 +122,19 @@ export async function groqTranscribeAudio(
   // near-silent recording Whisper otherwise "hears" a stock phrase ("תודה.").
   form.append("response_format", "verbose_json");
 
-  const response = await fetch(`${GROQ_BASE_URL}/audio/transcriptions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: form,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${GROQ_BASE_URL}/audio/transcriptions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: form,
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "groq transcription failed" };
+  }
 
   const raw = await response.text();
   let data: GroqWhisperResponse;

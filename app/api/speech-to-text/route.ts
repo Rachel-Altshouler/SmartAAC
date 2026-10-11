@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { geminiTranscribeAudio, getGeminiApiKey } from "@/lib/gemini";
 import { getGroqApiKey, groqTranscribeAudio } from "@/lib/groq";
 import { isOllamaWhisperAvailable, ollamaTranscribeAudio } from "@/lib/ollama";
+import { isProviderSkipped, noteProviderFailure } from "@/lib/provider-health";
 
 type WhisperResponse = {
   text?: string;
@@ -77,8 +78,9 @@ export async function POST(request: Request) {
     }
   }
 
-  if (getGroqApiKey()) {
+  if (getGroqApiKey() && !isProviderSkipped("groq-speech")) {
     const groqResult = await groqTranscribeAudio(audio);
+    if (!groqResult.ok) noteProviderFailure("groq-speech", groqResult.error);
     if (groqResult.ok && isQuietHallucination(groqResult.text, peak)) {
       return NextResponse.json({ error: "empty transcript" }, { status: 422 });
     }
@@ -90,7 +92,10 @@ export async function POST(request: Request) {
     }
   }
 
-  const openAiResult = await transcribeWithOpenAi(audio);
+  const openAiResult: { text?: string; error?: string } = isProviderSkipped("openai-speech")
+    ? { error: "openai skipped after a lasting failure" }
+    : await transcribeWithOpenAi(audio);
+  if (openAiResult.error) noteProviderFailure("openai-speech", openAiResult.error);
   if (openAiResult.text && isQuietHallucination(openAiResult.text, peak)) {
     return NextResponse.json({ error: "empty transcript" }, { status: 422 });
   }

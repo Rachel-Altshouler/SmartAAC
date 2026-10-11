@@ -205,7 +205,7 @@ function buildTopicReply(clean: string, ctx: DetectedContext, userTurns: number)
   }
 
   if (clean.includes("שמח") || clean.includes("כיף")) {
-    return "איזה יופי! שמח/ה לשמוע. מה הכי שמח אותך?";
+    return "איזה יופי! אני שמח לשמוע. מה הכי שמח אותך?";
   }
 
   if (ctx.school) {
@@ -264,7 +264,7 @@ function buildNeedReply(need: string): string {
     case "rest":
       return "נשמע שאת/ה עייף/ה. תרצה/י לנוח או לספר למישהו?";
     case "sad":
-      return "אני מצטער/ת שקשה לך. לפעמים עוזר לדבר, לנוח, או לקבל חיבוק.";
+      return "אני מצטער שקשה לך. לפעמים עוזר לדבר, לנוח, או לקבל חיבוק.";
     case "angry":
       return "זה בסדר להרגיש כעס. מה גרם לך להתעצבן?";
     case "help":
@@ -310,7 +310,7 @@ function buildCuriousFallback(text: string, userTurns: number): string {
   if (words.length >= 2) {
     return pick(
       [
-        `שמעתי אותך על "${words.slice(0, 4).join(" ")}". ספר/י עוד — מה הכי חשוב לך בזה?`,
+        "שמעתי אותך. ספר/י עוד — מה הכי חשוב לך בזה?",
         "נשמע שיש כאן משהו מעניין. ספר/י מה קורה, ואיך הרגשת?",
         "אני רוצה להבין יותר. ספר/י פרטים — מי, מה, ואיך זה גרם לך להרגיש?",
       ],
@@ -321,16 +321,48 @@ function buildCuriousFallback(text: string, userTurns: number): string {
   return pick(
     [
       "ספר/י לי עוד — על מה בדיוק את/ה רוצה לדבר?",
-      "אני כאן ומקשיב/ה. מה עובר עליך/עלייך עכשיו?",
+      "אני כאן ומקשיב. מה עובר עליך/עלייך עכשיו?",
     ],
     userTurns,
   );
 }
 
+// The replies above are written once with both forms ("ספר/י"); the child
+// hears only their own, never the slash.
+const GENDER_FORMS: Record<string, { boy: string; girl: string }> = {
+  "את/ה": { boy: "אתה", girl: "את" },
+  "שאת/ה": { boy: "שאתה", girl: "שאת" },
+  "ספר/י": { boy: "ספר", girl: "ספרי" },
+  "תרצה/י": { boy: "תרצה", girl: "תרצי" },
+  "בוא/י": { boy: "בוא", girl: "בואי" },
+  "תביא/י": { boy: "תביא", girl: "תביאי" },
+  "ותנוח/י": { boy: "ותנוח", girl: "ותנוחי" },
+  "מצא/י": { boy: "מצא", girl: "מצאי" },
+  "תבחר/י": { boy: "תבחר", girl: "תבחרי" },
+  "תוכל/י": { boy: "תוכל", girl: "תוכלי" },
+  "אוהב/ת": { boy: "אוהב", girl: "אוהבת" },
+  "יודע/ת": { boy: "יודע", girl: "יודעת" },
+  "חושב/ת": { boy: "חושב", girl: "חושבת" },
+  "מפחד/ת": { boy: "מפחד", girl: "מפחדת" },
+  "מתרגש/ת": { boy: "מתרגש", girl: "מתרגשת" },
+  "מרגיש/ה": { boy: "מרגיש", girl: "מרגישה" },
+  "עייף/ה": { boy: "עייף", girl: "עייפה" },
+  "אליך/אלייך": { boy: "אליך", girl: "אלייך" },
+  "עליך/עלייך": { boy: "עליך", girl: "עלייך" },
+};
+
+const inGender = (text: string, gender: "boy" | "girl"): string =>
+  text.replace(/[א-ת]+\/[א-ת]+/g, (form) => GENDER_FORMS[form]?.[gender] ?? form);
+
 export function buildLocalChildAiAnswer(
   message: string,
   history: ChatTurn[] = [],
+  gender: "boy" | "girl" = "boy",
 ): string {
+  return inGender(buildBothFormsAnswer(message, history), gender);
+}
+
+function buildBothFormsAnswer(message: string, history: ChatTurn[]): string {
   const text = message.trim();
   const clean = text.toLowerCase();
   const userTurns = history.filter((item) => item.role === "user").length;
@@ -343,7 +375,7 @@ export function buildLocalChildAiAnswer(
     return pick(
       [
         "ספר/י עוד — מה הכי חשוב לך בזה?",
-        "אני מקשיב/ה. מה עוד תרצה/י לספר?",
+        "אני מקשיב. מה עוד תרצה/י לספר?",
         "הבנתי. ספר/י פרט נוסף.",
       ],
       userTurns + 1,
@@ -355,7 +387,7 @@ export function buildLocalChildAiAnswer(
   }
 
   if (/^(שלום|היי|הי$|בוקר|ערב)/.test(clean)) {
-    return reply("שלום! שמח/ה לדבר איתך. מה עובר עליך/עלייך היום?");
+    return reply("שלום! אני שמח לדבר איתך. מה עובר עליך/עלייך היום?");
   }
 
   if (ctx.needs) {
@@ -381,7 +413,7 @@ export function buildLocalChildAiAnswer(
     clean.startsWith("איפה ")
   ) {
     return reply(
-      "שאלה טובה. אני לא תמיד יודע/ת הכל, אבל אפשר לחשוב יחד — מה את/ה חושב/ת?",
+      "שאלה טובה. אני לא תמיד יודע הכל, אבל אפשר לחשוב יחד — מה את/ה חושב/ת?",
     );
   }
 
