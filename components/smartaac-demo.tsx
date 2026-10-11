@@ -2443,11 +2443,17 @@ export function SmartAACDemo() {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: `${window.location.origin}/reset-password`,
     });
-    setAuthMessage(
-      error
-        ? "לא הצלחנו לשלוח את המייל. נסו שוב בעוד כמה דקות."
-        : `שלחנו ל-${email} מייל עם קישור לבחירת סיסמה חדשה. בדקו גם בספאם.`,
-    );
+    if (error) {
+      console.error("resetPasswordForEmail failed:", error);
+      const isRateLimited = /rate limit|too many/i.test(error.message);
+      setAuthMessage(
+        isRateLimited
+          ? "יותר מדי בקשות מייל בזמן קצר. המתינו כמה דקות ונסו שוב."
+          : `לא הצלחנו לשלוח את המייל: ${error.message}`,
+      );
+      return;
+    }
+    setAuthMessage(`שלחנו ל-${email} מייל עם קישור לבחירת סיסמה חדשה. בדקו גם בספאם.`);
   };
 
   const quickParentEntry = (): void => {
@@ -5535,7 +5541,7 @@ function Dashboard({
               >
                 <span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-amber-200 text-2xl">🔔</span>
                 <strong className="font-bold">
-                  יש מחר {eventInfo(event).emoji} {event.title}
+                  יש מחר {eventInfo(event).emoji} {event.title} ל{state.activeChildName || "הילד/ה"}
                 </strong>
               </div>
             ))}
