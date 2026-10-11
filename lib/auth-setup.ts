@@ -45,8 +45,18 @@ export type AuthSuccessPayload = {
 const createTeacherInviteCode = (): string =>
   `AAC-${Math.floor(1000 + Math.random() * 9000)}`;
 
+// "aac-4535", " AAC 4535 " and "4535" all mean AAC-4535 (codes are made as
+// AAC-#### in capitals, so existing ones keep matching).
+const normalizeAccessCode = (rawCode: string): string => {
+  const compact = rawCode.trim().toUpperCase().replace(/\s+/g, "");
+  const digits = compact.match(/^(?:AAC-?)?(\d{4})$/);
+  return digits ? `AAC-${digits[1]}` : compact;
+};
+
 const hashAccessCode = (rawCode: string): string =>
-  createHash("md5").update(rawCode.trim()).digest("hex");
+  createHash("md5").update(normalizeAccessCode(rawCode)).digest("hex");
+
+const WRONG_CODE_MESSAGE = 'קוד הילד/ה לא נכון. בדקו אותו — הקוד מופיע בלוח הבקרה, במסך "סקירה".';
 
 const isMissingDbFunction = (message: string): boolean => {
   const lower = message.toLowerCase();
@@ -264,7 +274,7 @@ const joinChildByCode = async (
   const matched = activeCodes.data?.find((row) => row.code_hash === codeHash);
 
   if (!matched) {
-    throw new Error("invalid child access code");
+    throw new Error(WRONG_CODE_MESSAGE);
   }
 
   const child = await admin
@@ -278,7 +288,7 @@ const joinChildByCode = async (
   }
 
   if (!child.data) {
-    throw new Error("invalid child access code");
+    throw new Error(WRONG_CODE_MESSAGE);
   }
 
   await ensureUserProfileWithAdmin({
@@ -473,11 +483,14 @@ const resolveLoginAccessCode = async (
 ): Promise<string> => {
   for (const candidate of [requestedCode?.trim(), knownCode?.trim()]) {
     if (candidate && (await isActiveChildAccessCode(client, childId, candidate))) {
-      return candidate;
+      return normalizeAccessCode(candidate);
     }
   }
+  // The child already has a code: keep it (a new one only for a new child).
+  const existing = await readActiveChildCode(childId);
+  if (existing) return existing;
 
-  const code = requestedCode?.trim() || createTeacherInviteCode();
+  const code = requestedCode?.trim() ? normalizeAccessCode(requestedCode) : createTeacherInviteCode();
   await storeChildAccessCode(client, childId, code, userId, false);
   return code;
 };
@@ -572,7 +585,7 @@ export const loginWithChildCode = async (input: {
       accountType: "join",
       email,
       name,
-      childAccessCode: input.code.trim(),
+      childAccessCode: normalizeAccessCode(input.code),
     });
     return { ...payload, mode };
   }
