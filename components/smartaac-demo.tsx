@@ -788,6 +788,10 @@ const firstGrapheme = (value: string): string => {
   return Array.from(trimmed)[0] ?? trimmed;
 };
 
+// Category of words typed in while creating a weekly topic: no such category
+// on the board, so they appear only with their topic, not in the board's rows.
+const TOPIC_WORDS_CATEGORY_ID = "topic-words";
+
 // Hebrew search in the ARASAAC pictograms (the same symbols as the board).
 const searchPictograms = async (query: string): Promise<number[]> => {
   const response = await fetch(`https://api.arasaac.org/v1/pictograms/he/search/${encodeURIComponent(query)}`, {
@@ -2481,7 +2485,10 @@ export function SmartAACDemo() {
         name: parentName.trim() || (authMode === "parent" ? "הורה" : "מורה"),
         email: parentEmail.trim(),
         childName: childName.trim() || "דניאל",
-        childAccessCode: childAccessCode.trim(),
+        // Signing in / joining with Google always asks for the child's code
+        // after Google — even when one is already in the field or the account
+        // already works with a child — so the code is not sent along.
+        childAccessCode: googleAccountType === "join" ? "" : childAccessCode.trim(),
         functionalityLevel: state.level,
       };
 
@@ -6352,16 +6359,42 @@ function TopicDashboard({
   const [pickedIds, setPickedIds] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [formError, setFormError] = useState("");
+  // Words typed in for this topic that aren't symbols yet; they become symbols
+  // only when the topic is saved (cancel leaves nothing behind).
+  const [newWords, setNewWords] = useState<AacSymbol[]>([]);
+  const [isAddingWord, setIsAddingWord] = useState(false);
 
   const customTopics = state.customTopics ?? [];
-  const symbolById = Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])) as Record<
+  const symbolById = Object.fromEntries([...allSymbols, ...newWords].map((symbol) => [symbol.id, symbol])) as Record<
     string,
     AacSymbol
   >;
   const query = search.trim();
-  const searchResults = allSymbols
+  const searchResults = [...newWords, ...allSymbols]
     .filter((symbol) => !query || symbol.label.includes(query))
     .slice(0, 48);
+  const queryExists = [...allSymbols, ...newWords].some((symbol) => symbol.label === query);
+
+  // A word that isn't on the board: a new symbol (with the ARASAAC pictogram
+  // for it, when there is one), picked for this topic.
+  const addNewWord = async (): Promise<void> => {
+    const word = query.slice(0, 30);
+    if (!word || queryExists || isAddingWord) return;
+    setIsAddingWord(true);
+    const pictogramId = (await searchPictograms(word).catch(() => []))[0];
+    const symbol: AacSymbol = {
+      id: `custom-${Date.now()}`,
+      label: word,
+      emoji: "⭐",
+      categoryId: TOPIC_WORDS_CATEGORY_ID,
+      ...(pictogramId ? { pictogramId } : {}),
+    };
+    setNewWords((current) => [...current, symbol]);
+    setPickedIds((current) => [...current, symbol.id]);
+    setSearch("");
+    setFormError("");
+    setIsAddingWord(false);
+  };
 
   const togglePicked = (symbolId: string): void =>
     setPickedIds((current) =>
@@ -6383,25 +6416,36 @@ function TopicDashboard({
       emoji,
       symbolIds: pickedIds,
     };
+    const addedWords = newWords.filter((symbol) => pickedIds.includes(symbol.id));
     update((current) => ({
       ...current,
+      customSymbols: [...current.customSymbols, ...addedWords],
       customTopics: [...(current.customTopics ?? []), topic],
       weeklyTopicId: topic.id,
     }));
     setIsCreating(false);
     setLabel("");
     setPickedIds([]);
+    setNewWords([]);
     setSearch("");
     setFormError("");
   };
 
   const deleteTopic = (topicId: string): void => {
     if (!window.confirm("למחוק את הנושא הזה?")) return;
-    update((current) => ({
-      ...current,
-      customTopics: (current.customTopics ?? []).filter((topic) => topic.id !== topicId),
-      weeklyTopicId: current.weeklyTopicId === topicId ? "feelings" : current.weeklyTopicId,
-    }));
+    update((current) => {
+      const remaining = (current.customTopics ?? []).filter((topic) => topic.id !== topicId);
+      // Words added just for topics go too, unless another topic still uses them.
+      const stillUsed = new Set(remaining.flatMap((topic) => topic.symbolIds));
+      return {
+        ...current,
+        customTopics: remaining,
+        customSymbols: current.customSymbols.filter(
+          (symbol) => symbol.categoryId !== TOPIC_WORDS_CATEGORY_ID || stillUsed.has(symbol.id),
+        ),
+        weeklyTopicId: current.weeklyTopicId === topicId ? "feelings" : current.weeklyTopicId,
+      };
+    });
   };
 
   const topicButton = (topic: WeeklyTopic, isCustom: boolean) => {
@@ -6513,7 +6557,20 @@ function TopicDashboard({
             value={search}
             onChange={(event) => setSearch(event.target.value)}
             placeholder="🔍 חיפוש סמל: כדור, שמח, אמא..."
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !queryExists) void addNewWord();
+            }}
           />
+          {query && !queryExists && (
+            <button
+              type="button"
+              className="mt-2 rounded-2xl border-2 border-dashed border-blue-300 bg-blue-50 px-4 py-2 font-black text-blue-800 disabled:opacity-60"
+              disabled={isAddingWord}
+              onClick={() => void addNewWord()}
+            >
+              {isAddingWord ? "מחפש תמונה לסמל..." : `➕ להוסיף את "${query}" כסמל חדש בנושא`}
+            </button>
+          )}
           <div className="mt-3 grid max-h-72 grid-cols-3 gap-2 overflow-y-auto sm:grid-cols-6 lg:grid-cols-8">
             {searchResults.map((symbol) => {
               const isPicked = pickedIds.includes(symbol.id);
@@ -6558,6 +6615,9 @@ function TopicDashboard({
               className="rounded-2xl border border-slate-200 px-5 py-3 font-black"
               onClick={() => {
                 setIsCreating(false);
+                setNewWords([]);
+                // The typed-in words are dropped, so they can't stay picked.
+                setPickedIds((current) => current.filter((id) => allSymbols.some((symbol) => symbol.id === id)));
                 setFormError("");
               }}
             >
