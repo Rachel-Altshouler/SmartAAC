@@ -201,7 +201,9 @@ const readGoogleNameFromMetadata = (
   return "";
 };
 
-async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
+type NeedChildCode = { needCode: true; mode: "parent" | "teacher"; mustBeMember: boolean; email: string; name: string };
+
+async function recoverOAuthAuthResult(): Promise<RecoveredAuth | NeedChildCode | null> {
   if (!supabase) return null;
 
   const rawResult = window.sessionStorage.getItem("smartaac-auth-result");
@@ -233,41 +235,10 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
   const session = sessionResult.data.session;
   if (!session) return null;
 
-  const accessToken = session.access_token;
-  const meRes = await fetch("/api/auth/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (meRes.ok) {
-    const profile = (await meRes.json()) as {
-      userId?: string;
-      email?: string;
-      name?: string;
-      role?: "parent" | "teacher";
-      accountType?: AccountType;
-      childId?: string;
-      childName?: string;
-      teacherEmail?: string;
-      linkedChildren?: Array<{ id: string; name: string }>;
-    };
-
-    const isTeacher = profile.role === "teacher";
-    const hasChild = Boolean(profile.childId || profile.linkedChildren?.length);
-
-    if (profile.userId && profile.email && hasChild) {
-      return {
-        email: profile.email,
-        name: profile.name ?? (isTeacher ? "מורה" : "הורה"),
-        userId: profile.userId,
-        childId: profile.childId ?? profile.linkedChildren?.[0]?.id,
-        childName: profile.childName ?? profile.linkedChildren?.[0]?.name,
-        teacherEmail: profile.teacherEmail,
-        linkedChildren: profile.linkedChildren,
-        mode: isTeacher ? "teacher" : "parent",
-        accountType: profile.accountType ?? "create",
-      };
-    }
-  }
+  // Only right after this app's own Google button (its draft is waiting) —
+  // never a silent sign-in from a Google session left in the browser: the
+  // child's code is needed at every sign-in.
+  if (!window.sessionStorage.getItem(authDraftKey)) return null;
 
   const draft = readAuthDraft();
   const googleEmail = session.user.email ?? draft.email;
@@ -307,6 +278,17 @@ async function recoverOAuthAuthResult(): Promise<RecoveredAuth | null> {
     accountType?: AccountType;
     mode?: "parent" | "teacher";
   };
+
+  if (setupRes.status === 409 && (payload as { needCode?: boolean }).needCode) {
+    window.sessionStorage.removeItem(authDraftKey);
+    return {
+      needCode: true,
+      mode: draft.mode === "teacher" ? "teacher" : "parent",
+      mustBeMember: draft.mustBeMember === true,
+      email: payload.email ?? googleEmail,
+      name: payload.name ?? googleName,
+    };
+  }
 
   if (!setupRes.ok || !payload.userId) {
     return null;
@@ -1371,7 +1353,10 @@ export function SmartAACDemo() {
       if (googleCodePendingRef.current) return;
 
       const recovered = await recoverOAuthAuthResult();
-      if (recovered) {
+      if (recovered && "needCode" in recovered) {
+        setGoogleCodeStep(recovered);
+        setIsEntryOpen(true);
+      } else if (recovered) {
         applyRecoveredAuthToState(recovered, updateState, setSavedSession, setTeacherEmail);
       }
     };
@@ -2218,6 +2203,10 @@ export function SmartAACDemo() {
       const recovered = await recoverOAuthAuthResult();
       window.history.replaceState({}, "", "/");
 
+      if (recovered && "needCode" in recovered) {
+        setGoogleCodeStep(recovered);
+        return;
+      }
       if (!recovered) {
         setAuthMessage(
           "ההתחברות עם Google הצליחה, אבל לא הצלחנו לשמור ב-Supabase. ודא/י ש-SUPABASE_SERVICE_ROLE_KEY מוגדר ב-.env.local.",
