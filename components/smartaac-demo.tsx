@@ -41,6 +41,7 @@ import { PrintSymbolsDashboard } from "@/components/print-symbols";
 import { ChildDevicePanel, isChildDeviceEnabled, ParentPinModal } from "@/components/child-device";
 import { buildLocalChildAiAnswer } from "@/lib/local-ai";
 import { buildTeacherInviteContent } from "@/lib/teacher-invite";
+import { pathToScreen, screenToPath, type Screen } from "@/lib/screen-routes";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase-browser";
 import {
   parseStory,
@@ -107,6 +108,7 @@ type DashboardView =
   | "overview"
   | "events"
   | "topic"
+  | "level"
   | "symbols"
   | "library"
   | "daily"
@@ -1915,6 +1917,123 @@ export function SmartAACDemo() {
     () => Object.fromEntries(allSymbols.map((symbol) => [symbol.id, symbol])),
     [allSymbols],
   ) as Record<string, AacSymbol>;
+
+  // ---- an address for every screen (lib/screen-routes.ts) ----
+  // The screens themselves don't change: the address follows the open screen,
+  // and an address (a link, refresh, back / forward) opens its screen. The
+  // dashboard still needs sign-in (or the child device's PIN) — an address
+  // never opens it by itself.
+  const currentScreen: Screen = isDashboardOpen
+    ? { kind: "dashboard", view: dashboardView }
+    : isEntryOpen
+      ? { kind: "entry" }
+      : { kind: "child", view: childView };
+  const currentPath = screenToPath(currentScreen);
+  const currentPathRef = useRef(currentPath);
+  currentPathRef.current = currentPath;
+  const routeReadyRef = useRef(false);
+  // Open during this visit (signed in / PIN) — closed again on leaving it.
+  const dashboardUnlockedRef = useRef(false);
+  useEffect(() => {
+    if (isDashboardOpen) dashboardUnlockedRef.current = true;
+    else if (routeReadyRef.current) dashboardUnlockedRef.current = false;
+  }, [isDashboardOpen]);
+
+  const openChildScreen = (view: Extract<Screen, { kind: "child" }>["view"]): void => {
+    const known = view.type !== "category" || allCategories.some((category) => category.id === view.categoryId);
+    setIsDashboardOpen(false);
+    setIsEntryOpen(false);
+    setChildView(known ? view : { type: "home" });
+  };
+
+  // Asked for the dashboard without being in it: the child device asks for
+  // its PIN, anyone else signs in — and lands on the screen they asked for.
+  const askForDashboard = (view: Extract<Screen, { kind: "dashboard" }>["view"]): void => {
+    setDashboardView(view);
+    if (isChildDeviceEnabled()) {
+      setIsEntryOpen(false);
+      setIsParentPinOpen(true);
+    } else {
+      setIsEntryOpen(true);
+      setAuthScreen("login");
+      setIsLoginOpen(true);
+    }
+  };
+
+  // First load: open the screen of the address.
+  useEffect(() => {
+    if (!hasLoadedStoredState || routeReadyRef.current) return;
+    const target = pathToScreen(window.location.pathname);
+    const finish = (): void => {
+      routeReadyRef.current = true;
+      window.history.replaceState(window.history.state, "", currentPathRef.current + window.location.search);
+    };
+    if (!target || target.kind === "entry") {
+      finish();
+      return;
+    }
+    if (target.kind === "child") {
+      openChildScreen(target.view);
+      window.setTimeout(finish, 0);
+      return;
+    }
+    // A refresh inside the dashboard keeps it (same visit, still signed in);
+    // a new tab or a link to it asks to sign in first.
+    const navigation = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+    const isRefresh = navigation?.type === "reload";
+    void (async () => {
+      const session = supabase ? (await supabase.auth.getSession()).data.session : null;
+      if (isRefresh && session && latestStateRef.current.isRegisteredInSupabase && latestStateRef.current.supabaseChildId) {
+        setDashboardView(target.view);
+        setIsEntryOpen(false);
+        setIsDashboardOpen(true);
+      } else {
+        askForDashboard(target.view);
+      }
+      window.setTimeout(finish, 0);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasLoadedStoredState]);
+
+  // The open screen → the address.
+  useEffect(() => {
+    if (!routeReadyRef.current) return;
+    if (window.location.pathname !== currentPath) {
+      window.history.pushState(null, "", currentPath);
+    }
+  }, [currentPath]);
+
+  // Back / forward.
+  useEffect(() => {
+    const onPopState = (): void => {
+      if (!routeReadyRef.current) return;
+      const target = pathToScreen(window.location.pathname);
+      if (!target) return;
+      if (target.kind === "entry") {
+        setIsDashboardOpen(false);
+        if (isChildDeviceEnabled()) {
+          // the child's device has no entry screen — it stays on the board
+          setIsEntryOpen(false);
+          window.history.replaceState(window.history.state, "", "/child");
+        } else {
+          setIsEntryOpen(true);
+        }
+      } else if (target.kind === "child") {
+        openChildScreen(target.view);
+      } else if (dashboardUnlockedRef.current) {
+        setDashboardView(target.view);
+        setIsEntryOpen(false);
+        setIsDashboardOpen(true);
+      } else {
+        window.history.replaceState(window.history.state, "", currentPathRef.current);
+        askForDashboard(target.view);
+      }
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allCategories]);
+
   const updateState = (updater: (current: DemoState) => DemoState): void => {
     setState((current) => updater(current));
   };
