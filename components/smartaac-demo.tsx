@@ -5686,7 +5686,9 @@ function Dashboard({
                     {new Intl.DateTimeFormat("he-IL", { weekday: "long", day: "numeric", month: "long" }).format(new Date())}
                   </p>
                   <h1 className="mt-1 text-4xl font-extrabold tracking-tight">
-                    <span className="text-2xl font-medium text-blue-100">אחראית על </span>
+                    <span className="text-2xl font-medium text-blue-100">
+                      {state.dashboardRole === "teacher" ? "המורה של " : "ההורה של "}
+                    </span>
                     {state.activeChildName || "הילד/ה"}
                   </h1>
                   {childPhotoError && (
@@ -5723,7 +5725,9 @@ function Dashboard({
                       {state.parentEmail || "לא הוגדר אימייל"}
                     </p>
                     <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm">
-                      <span className="block text-sm font-black text-muted">אחראית על</span>
+                      <span className="block text-sm font-black text-muted">
+                        {state.dashboardRole === "teacher" ? "המורה של" : "ההורה של"}
+                      </span>
                       <span className="mt-1 block text-3xl font-black">{state.activeChildName || "—"}</span>
                     </div>
                     <div
