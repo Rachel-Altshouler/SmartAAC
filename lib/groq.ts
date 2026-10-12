@@ -43,6 +43,10 @@ export async function groqChat(options: {
   systemPrompt?: string;
   temperature?: number;
   timeoutMs?: number;
+  // Longer answers (a whole story) need more than the chat's short reply.
+  maxTokens?: number;
+  // Ask for a JSON object only (the prompt must mention JSON).
+  json?: boolean;
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const apiKey = getGroqApiKey();
   if (!apiKey) {
@@ -67,7 +71,8 @@ export async function groqChat(options: {
           { role: "user", content: options.message },
         ],
         temperature: options.temperature ?? 0.85,
-        max_tokens: 320,
+        max_tokens: options.maxTokens ?? 320,
+        ...(options.json ? { response_format: { type: "json_object" } } : {}),
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? 20000),
     });

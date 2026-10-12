@@ -4494,15 +4494,19 @@ function ChildEventsView({
   );
 }
 
+// How long a child who tapped "start" waits for an AI story still on its way.
+const STORY_MAX_WAIT_MS = 15000;
+
 async function loadAiStory(avoidTitles: string[]): Promise<Story | null> {
   try {
     const response = await fetch("/api/story-game", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ avoidTitles }),
-      // Short on purpose: if the AI is slow or blocked, the child gets a
-      // ready-made story instead of waiting.
-      signal: AbortSignal.timeout(10000),
+      // A bit over the server's worst case (Gemini racing OpenAI, then Groq),
+      // so a slow-but-working AI still delivers. Stories are fetched ahead of
+      // time, so the child rarely waits for this.
+      signal: AbortSignal.timeout(35000),
     });
     const data = (await readJsonResponse(response)) as { story?: unknown };
     return data.story ? parseStory(data.story) : null;
@@ -4556,6 +4560,27 @@ function StoryGameView({
   const [playedTitles, setPlayedTitles] = useState<string[]>([]);
   // The story starts only when the child taps "start".
   const [started, setStarted] = useState(false);
+  // The next AI story, asked for ahead of time: when the screen opens, and
+  // again as each story starts, so "start" and "new story" rarely wait.
+  const upcomingStoryRef = useRef<Promise<Story | null> | null>(null);
+  useEffect(() => {
+    upcomingStoryRef.current = loadAiStory([]);
+  }, []);
+  // Waits at most `maxWaitMs` for the story fetched ahead of time. One that is
+  // still on its way stays for the next "new story" instead of being lost.
+  const takeUpcomingStory = async (maxWaitMs: number): Promise<Story | null> => {
+    const upcoming = upcomingStoryRef.current;
+    upcomingStoryRef.current = null;
+    if (!upcoming) return null;
+    const timedOut = Symbol("timed out");
+    const result = await Promise.race([
+      upcoming,
+      new Promise<typeof timedOut>((resolve) => window.setTimeout(() => resolve(timedOut), maxWaitMs)),
+    ]);
+    if (result !== timedOut) return result;
+    upcomingStoryRef.current ??= upcoming;
+    return null;
+  };
 
   const playStep = (index: number, current: Story): void => {
     const step = current.steps[index];
@@ -4594,6 +4619,7 @@ function StoryGameView({
     setFinished(false);
     setFeedback("");
     setPlayedTitles((current) => [...current, next.title].slice(-10));
+    upcomingStoryRef.current = loadAiStory([...playedTitles, next.title].slice(-10));
     // Title first, then the first sentence.
     setNarrating(true);
     onSpeak(next.title, () => playStep(0, next));
@@ -4627,11 +4653,28 @@ function StoryGameView({
 
   // One "new story" button: a fresh AI-written story when the AI answers,
   // otherwise (offline, blocked, slow) one of the ready-made stories.
+  // The story fetched ahead of time (usually ready by now); if that one
+  // failed, one fresh try. Nothing in time → a ready-made story.
   const startNextStory = async (): Promise<void> => {
     setIsLoadingNext(true);
-    const next = await loadAiStory(playedTitles);
+    let next = await takeUpcomingStory(STORY_MAX_WAIT_MS);
+    // Only when the early one failed (not when it's merely slow).
+    if (!next && !upcomingStoryRef.current) {
+      upcomingStoryRef.current = loadAiStory(playedTitles);
+      next = await takeUpcomingStory(STORY_MAX_WAIT_MS);
+    }
     setIsLoadingNext(false);
     startStory(next ?? pickLocalStory(story.id));
+  };
+
+  // The first story: the AI one asked for when the screen opened (waiting a
+  // little if it's still on its way), else a ready-made one.
+  const startFirstStory = async (): Promise<void> => {
+    setIsLoadingNext(true);
+    const first = await takeUpcomingStory(STORY_MAX_WAIT_MS);
+    setIsLoadingNext(false);
+    setStarted(true);
+    startStory(first ?? story);
   };
 
   // Completed steps show their full sentence; the current one shows the
@@ -4659,14 +4702,12 @@ function StoryGameView({
         <div className="grid flex-1 place-items-center">
           <button
             type="button"
-            className="flex flex-col items-center gap-3 rounded-[2rem] bg-gradient-to-br from-rose-400 to-orange-400 px-16 py-10 text-white shadow-soft transition active:scale-95"
-            onClick={() => {
-              setStarted(true);
-              startStory(story);
-            }}
+            className="flex flex-col items-center gap-3 rounded-[2rem] bg-gradient-to-br from-rose-400 to-orange-400 px-16 py-10 text-white shadow-soft transition active:scale-95 disabled:opacity-80"
+            disabled={isLoadingNext}
+            onClick={() => void startFirstStory()}
           >
-            <span className="text-7xl">▶️</span>
-            <span className="text-3xl font-black">מתחילים סיפור</span>
+            <span className="text-7xl">{isLoadingNext ? "📖" : "▶️"}</span>
+            <span className="text-3xl font-black">{isLoadingNext ? "מכינים סיפור..." : "מתחילים סיפור"}</span>
           </button>
         </div>
       ) : (

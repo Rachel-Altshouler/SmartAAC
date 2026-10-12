@@ -8,6 +8,9 @@ import { parseStory } from "@/lib/story-game";
 // Generates one whole connected story (all steps at once) so every sentence
 // continues the previous one. See lib/story-game.ts for the shape.
 
+// Gemini (≤10 + 12 s) racing Groq (6 + ≤12 s), then OpenAI (≤8 s): inside this limit.
+export const maxDuration = 40;
+
 type StoryRequest = { avoidTitles?: unknown };
 
 const STORY_SYSTEM_PROMPT = [
@@ -23,11 +26,21 @@ const STORY_SYSTEM_PROMPT = [
   'החזר/י אך ורק JSON תקין, בלי markdown, בפורמט: {"title":"...","emoji":"...","steps":[{"before":"...","answer":{"label":"...","emoji":"..."},"after":"...","wrong":[{"label":"...","emoji":"..."},{"label":"...","emoji":"..."}]}]}',
 ].join(" ");
 
+// Any letter that isn't Hebrew (models now and then slip in Greek or Latin:
+// "יום בגן הπαιχνίδια") — the child would hear gibberish read aloud.
+const FOREIGN_LETTER = /(?![֐-׿])\p{L}/u;
+
 const parseJsonStory = (raw: string) => {
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) return null;
   try {
-    return parseStory(JSON.parse(match[0]));
+    const story = parseStory(JSON.parse(match[0]));
+    if (!story) return null;
+    const texts = [
+      story.title,
+      ...story.steps.flatMap((step) => [step.before, step.after, step.answer.label, ...step.wrong.map((word) => word.label)]),
+    ];
+    return texts.some((text) => FOREIGN_LETTER.test(text)) ? null : story;
   } catch {
     return null;
   }
@@ -45,16 +58,18 @@ export async function POST(request: Request) {
     .filter((title): title is string => typeof title === "string")
     .slice(0, 10)
     .map((title) => title.slice(0, 40));
-  const message = avoid.length
-    ? `כתוב/כתבי סיפור חדש. אל תכתוב/י על הנושאים האלה, הם כבר היו: ${avoid.join(", ")}.`
-    : "כתוב/כתבי סיפור חדש.";
+  // Left to itself the model keeps writing the same few stories (a cake, a
+  // garden), so the topic is picked here, at random, skipping recent ones.
+  const fresh = STORY_TOPICS.filter((topic) => !avoid.some((title) => title.includes(topic.key)));
+  const pool = fresh.length ? fresh : STORY_TOPICS;
+  const topic = pool[Math.floor(Math.random() * pool.length)] as (typeof STORY_TOPICS)[number];
+  const message = [
+    `כתוב/כתבי סיפור חדש על: ${topic.text}.`,
+    avoid.length ? `אל תחזור/י על הסיפורים האלה, הם כבר היו: ${avoid.join(", ")}.` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   const options = { history: [], message, systemPrompt: STORY_SYSTEM_PROMPT };
-
-  const providers = [
-    { name: "gemini", enabled: Boolean(getGeminiApiKey()), run: () => geminiChat({ ...options, maxOutputTokens: 1200 }) },
-    { name: "groq", enabled: Boolean(getGroqApiKey()), run: () => groqChat(options) },
-    { name: "openai", enabled: Boolean(getOpenAiApiKey()), run: () => openAiChat(options) },
-  ];
 
   if (await isOllamaAvailable()) {
     const result = await ollamaChat(options);
@@ -62,12 +77,115 @@ export async function POST(request: Request) {
     if (story) return NextResponse.json({ story, provider: "ollama" });
   }
 
-  for (const provider of providers) {
-    if (!provider.enabled) continue;
-    const result = await provider.run();
-    const story = result.ok ? parseJsonStory(result.text) : null;
-    if (story) return NextResponse.json({ story, provider: provider.name });
+  // Gemini Flash-Lite (measured: 2–5 s). About 1 story in 4 comes back unusable
+  // (a Greek / Arabic word slipped in, or broken JSON) and is thrown out, so it
+  // tries again while there's time. (Not Flash: its free tier is 20 a day.)
+  // Groq joins after a few seconds as a backup, and the first valid story
+  // wins; OpenAI is the last resort.
+  const hasGemini = Boolean(getGeminiApiKey());
+  const gemini = hasGemini
+    ? (async () => {
+        const startedAt = Date.now();
+        for (let attempt = 0; attempt < 3 && Date.now() - startedAt < 10000; attempt += 1) {
+          const story = await storyFrom("gemini", () =>
+            geminiChat({ ...options, maxOutputTokens: STORY_MAX_TOKENS, json: true, timeoutMs: 12000 }),
+          );
+          if (story) return story;
+        }
+        return null;
+      })()
+    : null;
+  let answered = false;
+  const groq = getGroqApiKey()
+    ? (hasGemini ? wait(BACKUP_HEAD_START_MS) : Promise.resolve()).then(() =>
+        // Not needed once Gemini already delivered.
+        answered
+          ? null
+          : storyFrom("groq", () => groqChat({ ...options, maxTokens: STORY_MAX_TOKENS, json: true, timeoutMs: 12000 })),
+      )
+    : null;
+
+  const first = await firstStory([gemini, groq]);
+  answered = true;
+  if (first) return NextResponse.json(first);
+
+  if (getOpenAiApiKey()) {
+    const openAi = await storyFrom("openai", () =>
+      openAiChat({ ...options, maxTokens: STORY_MAX_TOKENS, json: true, timeoutMs: 8000 }),
+    );
+    if (openAi) return NextResponse.json(openAi);
   }
 
   return NextResponse.json({ story: null, provider: "local" });
 }
+
+// Everyday experiences a young child knows. `key` is a word the story's title
+// will likely contain, so recently played topics can be skipped.
+const STORY_TOPICS = [
+  { key: "חווה", text: "ביקור בחווה עם בעלי חיים" },
+  { key: "גשם", text: "יום גשום" },
+  { key: "יער", text: "טיול ביער" },
+  { key: "עוגה", text: "אפיית עוגה" },
+  { key: "ים", text: "יום בים" },
+  { key: "גן החיות", text: "ביקור בגן החיות" },
+  { key: "יום הולדת", text: "מסיבת יום הולדת" },
+  { key: "סופר", text: "קניות בסופר" },
+  { key: "רופא", text: "ביקור אצל הרופא" },
+  { key: "אוטובוס", text: "נסיעה באוטובוס" },
+  { key: "פארק", text: "משחק בפארק" },
+  { key: "שלג", text: "יום עם שלג" },
+  { key: "אמבטיה", text: "זמן אמבטיה בערב" },
+  { key: "כלב", text: "טיול עם הכלב" },
+  { key: "גינה", text: "שתילת פרחים בגינה" },
+  { key: "פיקניק", text: "פיקניק עם המשפחה" },
+  { key: "ספרייה", text: "ביקור בספרייה" },
+  { key: "סבתא", text: "ביקור אצל סבא וסבתא" },
+  { key: "רכבת", text: "נסיעה ברכבת" },
+  { key: "בריכה", text: "יום בבריכה" },
+  { key: "ציור", text: "ציור עם צבעים בגן" },
+  { key: "חג", text: "הכנות לחג עם המשפחה" },
+] as const;
+
+// A whole 5-step story as JSON (Hebrew, with emojis) runs to ~600–1500 tokens.
+const STORY_MAX_TOKENS = 3000;
+const BACKUP_HEAD_START_MS = 6000;
+
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+type StoryResult = { story: NonNullable<ReturnType<typeof parseJsonStory>>; provider: string };
+
+// One provider's attempt: resolves to a valid story, or null (failed / bad JSON).
+const storyFrom = async (
+  provider: string,
+  run: () => Promise<{ ok: true; text: string } | { ok: false; error: string }>,
+): Promise<StoryResult | null> => {
+  const result = await run();
+  const story = result.ok ? parseJsonStory(result.text) : null;
+  if (!story) {
+    const reason = result.ok ? `invalid story: ${result.text.slice(0, 300)}` : result.error;
+    console.warn(`smartaac: story from ${provider} failed:`, reason);
+  }
+  return story ? { story, provider } : null;
+};
+
+// The first attempt that comes back with a story; null once all have failed.
+const firstStory = (attempts: Array<Promise<StoryResult | null> | null>): Promise<StoryResult | null> => {
+  const running = attempts.filter((attempt): attempt is Promise<StoryResult | null> => attempt !== null);
+  if (running.length === 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let pending = running.length;
+    running.forEach((attempt) => {
+      attempt.then(
+        (result) => {
+          pending -= 1;
+          if (result) resolve(result);
+          else if (pending === 0) resolve(null);
+        },
+        () => {
+          pending -= 1;
+          if (pending === 0) resolve(null);
+        },
+      );
+    });
+  });
+};

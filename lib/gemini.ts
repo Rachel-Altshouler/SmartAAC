@@ -70,6 +70,7 @@ async function geminiGenerateWithModel(
     maxOutputTokens?: number;
     thinkingBudget?: number;
     timeoutMs?: number;
+    json?: boolean;
   },
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const apiKey = getGeminiApiKey();
@@ -94,6 +95,7 @@ async function geminiGenerateWithModel(
         generationConfig: {
           temperature: options?.temperature ?? 0.85,
           maxOutputTokens: options?.maxOutputTokens ?? 320,
+          ...(options?.json ? { responseMimeType: "application/json" } : {}),
           ...(options?.thinkingBudget !== undefined
             ? { thinkingConfig: { thinkingBudget: options.thinkingBudget } }
             : {}),
@@ -129,6 +131,7 @@ async function geminiGenerate(
     thinkingBudget?: number;
     timeoutMs?: number;
     models?: string[];
+    json?: boolean;
   },
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   if (!getGeminiApiKey()) {
@@ -162,6 +165,8 @@ export async function geminiChat(options: {
   maxOutputTokens?: number;
   temperature?: number;
   timeoutMs?: number;
+  // Answer with a JSON object only (Gemini's JSON mode).
+  json?: boolean;
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const contents: GeminiContent[] = [
     ...options.history.map((item) => ({
@@ -178,6 +183,7 @@ export async function geminiChat(options: {
     thinkingBudget: options.thinkingBudget,
     timeoutMs: options.timeoutMs,
     models: options.models,
+    json: options.json,
   });
 }
 
