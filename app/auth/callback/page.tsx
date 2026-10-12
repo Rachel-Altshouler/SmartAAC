@@ -157,6 +157,25 @@ export default function AuthCallbackPage() {
         accountType?: "create" | "join";
       };
 
+      if (response.status === 409 && (payload as { needCode?: boolean }).needCode) {
+        if (supabase) {
+          await supabase.auth.setSession({ access_token: session.access_token, refresh_token: session.refresh_token });
+        }
+        window.sessionStorage.setItem(
+          "smartaac-auth-need-code",
+          JSON.stringify({
+            mode: draft.mode,
+            mustBeMember: (draft as { mustBeMember?: boolean }).mustBeMember === true,
+            email: payload.email ?? googleEmail,
+            name: payload.name ?? googleName,
+          }),
+        );
+        window.sessionStorage.removeItem(authDraftKey);
+        window.history.replaceState({}, "", "/auth/callback");
+        router.replace("/?auth=need-code");
+        return;
+      }
+
       if (!response.ok) {
         setMessage(payload.error ?? "ההתחברות עם Google נכשלה.");
         return;

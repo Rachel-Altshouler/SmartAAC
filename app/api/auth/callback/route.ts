@@ -152,6 +152,19 @@ export async function POST(request: Request): Promise<NextResponse> {
 
 
 
+    // Joining / signing in with Google: the child's code is asked for after
+    // Google, so the first round comes without one.
+    if (accountType === "join" && !body.childAccessCode?.trim()) {
+      return NextResponse.json(
+        {
+          needCode: true,
+          email: exchanged.session.user.email ?? body.email ?? "",
+          name: readGoogleName(exchanged.session.user.user_metadata) || fallbackName,
+        },
+        { status: 409 },
+      );
+    }
+
     const googleName = readGoogleName(exchanged.session.user.user_metadata);
 
     const resolvedName = googleName || fallbackName;

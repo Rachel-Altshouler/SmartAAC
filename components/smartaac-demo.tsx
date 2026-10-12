@@ -1199,6 +1199,13 @@ export function SmartAACDemo() {
   const [rememberMe, setRememberMe] = useState(true);
   // "login" = the child's code + password only; "register" = all the details.
   const [authScreen, setAuthScreen] = useState<"login" | "register">("login");
+  // After Google: who signed in, waiting for the child's code.
+  const [googleCodeStep, setGoogleCodeStep] = useState<{
+    mode: AuthMode;
+    mustBeMember: boolean;
+    email: string;
+    name: string;
+  } | null>(null);
   const [savedSession, setSavedSession] = useState<{
     name: string;
     email: string;
@@ -1225,11 +1232,31 @@ export function SmartAACDemo() {
   const syncedImagesRef = useRef<Record<string, string> | null>(null);
   const latestStateRef = useRef<DemoState>(initialState);
   const skipRememberedFieldsRef = useRef(false);
+  const googleCodePendingRef = useRef(false);
   latestStateRef.current = state;
   const skipUsageStatsSyncRef = useRef(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") === "need-code") {
+      googleCodePendingRef.current = true;
+      try {
+        const raw = window.sessionStorage.getItem("smartaac-auth-need-code");
+        window.sessionStorage.removeItem("smartaac-auth-need-code");
+        const pending = raw ? (JSON.parse(raw) as { mode?: AuthMode; mustBeMember?: boolean; email?: string; name?: string }) : null;
+        if (pending) {
+          setGoogleCodeStep({
+            mode: pending.mode === "teacher" ? "teacher" : "parent",
+            mustBeMember: pending.mustBeMember === true,
+            email: pending.email ?? "",
+            name: pending.name ?? "",
+          });
+        }
+      } catch {
+        // nothing to resume — the regular sign-in stays available
+      }
+      window.history.replaceState({}, "", "/");
+    }
     const mode = params.get("mode");
     const code = params.get("code");
     if (code) {
@@ -1340,6 +1367,8 @@ export function SmartAACDemo() {
 
       const params = new URLSearchParams(window.location.search);
       if (params.get("auth") === "success") return;
+      // back from Google, waiting for the child's code: don't open a child yet
+      if (googleCodePendingRef.current) return;
 
       const recovered = await recoverOAuthAuthResult();
       if (recovered) {
@@ -2323,6 +2352,68 @@ export function SmartAACDemo() {
     }
   };
 
+  // The child's code after Google: sent with the Google session already made.
+  const submitGoogleCode = async (): Promise<void> => {
+    if (!googleCodeStep || !supabase) return;
+    const code = childAccessCode.trim();
+    if (!code) {
+      setAuthMessage("כתבו את קוד הילד/ה.");
+      return;
+    }
+    setIsAuthLoading(true);
+    setAuthMessage("");
+    try {
+      const session = (await supabase.auth.getSession()).data.session;
+      if (!session) throw new Error("ההתחברות עם Google פגה. נסו שוב.");
+      const response = await fetch("/api/auth/callback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accessToken: session.access_token,
+          refreshToken: session.refresh_token,
+          mode: googleCodeStep.mode,
+          accountType: "join",
+          mustBeMember: googleCodeStep.mustBeMember,
+          name: googleCodeStep.name,
+          email: googleCodeStep.email,
+          childAccessCode: code,
+        }),
+      });
+      const payload = (await readJsonResponse(response)) as {
+        error?: string;
+        session?: { access_token: string; refresh_token: string };
+        email?: string;
+        name?: string;
+        teacherInviteCode?: string;
+        userId?: string;
+        childId?: string;
+        childName?: string;
+        linkedChildren?: Array<{ id: string; name: string }>;
+        mode?: AuthMode;
+      };
+      if (!response.ok || !payload.userId) throw new Error(payload.error ?? "לא הצלחנו להתחבר.");
+      if (payload.session) {
+        await supabase.auth.setSession(payload.session).catch(() => undefined);
+      }
+      setGoogleCodeStep(null);
+      finishAuthSuccess({
+        email: payload.email ?? googleCodeStep.email,
+        name: payload.name ?? googleCodeStep.name,
+        teacherInviteCode: payload.teacherInviteCode ?? code,
+        userId: payload.userId,
+        childId: payload.childId,
+        childName: payload.childName,
+        linkedChildren: payload.linkedChildren,
+        role: payload.mode ?? googleCodeStep.mode,
+        accountType: "join",
+      });
+    } catch (error) {
+      setAuthMessage(translateAuthError(getErrorMessage(error)));
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
   const submitCodeLogin = async (): Promise<void> => {
     const code = childAccessCode.trim();
     if (!code || !password) {
@@ -2381,10 +2472,6 @@ export function SmartAACDemo() {
       return;
     }
     const googleAccountType: AccountType = authScreen === "login" ? "join" : authAccountType;
-    if (googleAccountType === "join" && !childAccessCode.trim()) {
-      setAuthMessage("כתבו קודם את קוד הילד/ה, ואז לחצו על Google.");
-      return;
-    }
 
     setIsAuthLoading(true);
     setAuthMessage("");
@@ -2709,6 +2796,75 @@ export function SmartAACDemo() {
             </button>
           </div>
         </section>
+
+        {googleCodeStep && (
+          <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+            <div className="flex min-h-full justify-center">
+              <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
+                <div className="mb-4 rounded-2xl bg-blue-50 p-4">
+                  <h2 className="mb-1 text-2xl font-black">
+                    שלום{googleCodeStep.name ? ` ${googleCodeStep.name}` : ""}! 👋
+                  </h2>
+                  <p className="text-muted">
+                    נכנסת עם Google{googleCodeStep.email ? ` (${googleCodeStep.email})` : ""}. עכשיו הקישו את קוד הילד/ה —
+                    והמערכת תיכנס אליו/ה.
+                  </p>
+                </div>
+                <label className="grid gap-1">
+                  <span className="text-sm font-black text-slate-600">קוד הילד/ה</span>
+                  <input
+                    className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-center text-lg font-bold tracking-widest"
+                    dir="ltr"
+                    autoFocus
+                    value={childAccessCode}
+                    onChange={(event) => setChildAccessCode(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") void submitGoogleCode();
+                    }}
+                    placeholder="AAC-1234"
+                  />
+                </label>
+                {authMessage && (
+                  <p className="mt-3 rounded-2xl bg-amber-50 p-3 text-sm font-bold text-amber-900">{authMessage}</p>
+                )}
+                {authMessage.includes("להירשם") && (
+                  <button
+                    type="button"
+                    className="mt-2 w-full rounded-2xl bg-emerald-600 px-5 py-3 font-bold text-white"
+                    onClick={() => {
+                      setGoogleCodeStep(null);
+                      setAuthMessage("");
+                      setAuthScreen("register");
+                      setAuthAccountType("join");
+                      setIsLoginOpen(true);
+                    }}
+                  >
+                    להרשמה למערכת
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="mt-5 w-full rounded-2xl bg-blue-500 px-5 py-3 text-lg font-bold text-white disabled:opacity-60"
+                  disabled={isAuthLoading}
+                  onClick={() => void submitGoogleCode()}
+                >
+                  {isAuthLoading ? "מתחבר..." : "כניסה"}
+                </button>
+                <button
+                  type="button"
+                  className="mt-3 w-full rounded-2xl border border-slate-200 px-5 py-3 font-bold"
+                  onClick={() => {
+                    setGoogleCodeStep(null);
+                    setAuthMessage("");
+                    void supabase?.auth.signOut();
+                  }}
+                >
+                  ביטול
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {isLoginOpen && (
           <LoginModal
@@ -3240,7 +3396,7 @@ function LoginModal({
                 <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
                 <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
               </svg>
-              כניסה עם Google (עם קוד הילד/ה)
+              כניסה עם Google
             </button>
             <p className="mt-3 text-center text-sm text-muted">
               עוד אין לך חשבון?{" "}
