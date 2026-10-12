@@ -107,7 +107,6 @@ type DashboardView =
   | "overview"
   | "events"
   | "topic"
-  | "level"
   | "symbols"
   | "library"
   | "daily"
@@ -5577,8 +5576,7 @@ function Dashboard({
         {[
           ["overview", "📊", "סקירה"],
           ["events", "📅", "אירועים ולוח שנה"],
-          ["topic", "📚", "נושא שבועי"],
-          ["level", "🎚️", "רמת תפקוד"],
+          ["topic", "📚", "נושא שבועי והגדרות"],
           ["symbols", "🔣", "סמלים"],
           ["daily", "📸", "מה עשינו היום"],
           ["print", "🖨️", "הדפסת סמלים"],
@@ -5854,7 +5852,7 @@ function Dashboard({
                     איך זה עובד?
                   </h2>
                   <p className="mt-2 leading-7 text-slate-700">
-                    ההורים והמורים מגדירים אירועים, נושא שבועי, תמונות ורמת תפקוד. הילד/ה רואה מסך תקשורת יציב,
+                    ההורים והמורים מגדירים אירועים, נושא שבועי ותמונות. הילד/ה רואה מסך תקשורת יציב,
                     עם סמלים שמתאימים למה שקורה בחיים שלו/ה.
                   </p>
                 </div>
@@ -5880,8 +5878,12 @@ function Dashboard({
             onDeleteEvent={onDeleteEvent}
           />
         )}
-        {view === "topic" && <TopicDashboard state={state} allSymbols={allSymbols} update={update} />}
-        {view === "level" && <LevelDashboard state={state} update={update} />}
+        {view === "topic" && (
+          <div className="space-y-10">
+            <TopicDashboard state={state} allSymbols={allSymbols} update={update} />
+            <ChildSettingsDashboard state={state} update={update} />
+          </div>
+        )}
         {view === "symbols" && (
           <SymbolsDashboard
             state={state}
@@ -6527,21 +6529,18 @@ function TopicDashboard({
   );
 }
 
-function LevelDashboard({
+// The child's own settings, shown under the weekly topic on the same page.
+function ChildSettingsDashboard({
   state,
   update,
 }: {
   state: DemoState;
   update: (updater: (current: DemoState) => DemoState) => void;
 }) {
-  const levels: Array<{ id: FunctionalityLevel; title: string; description: string }> = [
-    { id: "low", title: "נמוכה", description: "פחות סמלים, כפתורים גדולים, יותר משפטים מוכנים" },
-    { id: "medium", title: "בינונית", description: "שילוב בין משפטים מוכנים לבחירה חופשית" },
-    { id: "high", title: "גבוהה", description: "יותר סמלים ויותר עצמאות בבניית משפטים" },
-  ];
-
   return (
     <section>
+      <h1 className="text-3xl font-black">הגדרות</h1>
+      <p className="mb-6 text-muted">איך המערכת פונה ל{state.activeChildName || "ילד/ה"} ומקריאה לו/ה.</p>
       <div className="mb-6 flex flex-wrap items-center gap-3 rounded-soft border border-violet-200 bg-white p-4 shadow-sm">
         <span className="font-black">{state.activeChildName || "הילד/ה"} הוא/היא:</span>
         {(
@@ -6580,36 +6579,7 @@ function LevelDashboard({
         </label>
       </div>
 
-      <h1 className="text-3xl font-black">רמת תפקוד</h1>
-      <p className="mb-6 text-muted">הרמה נשלטת ידנית על ידי מטפל או הורה.</p>
-      <div className="grid gap-4 md:grid-cols-3">
-        {levels.map((level) => {
-          const isSelected = state.level === level.id;
-
-          return (
-          <button
-            key={level.id}
-            type="button"
-            className={cx(
-              "rounded-soft border p-5 text-right shadow-sm",
-              isSelected
-                ? "border-blue-500 bg-blue-500 text-white"
-                : "border-slate-200 bg-white text-slate-950",
-            )}
-            onClick={() => update((current) => ({ ...current, level: level.id }))}
-          >
-            <span className={cx("text-xl font-black", isSelected ? "text-white" : "text-slate-950")}>
-              {level.title}
-            </span>
-            <span className={cx("mt-2 block", isSelected ? "text-blue-50" : "text-slate-600")}>
-              {level.description}
-            </span>
-          </button>
-          );
-        })}
-      </div>
-
-      <div className="mt-6 rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="rounded-soft border border-slate-200 bg-white p-5 shadow-sm">
         <h2 className="text-xl font-black">קצב דיבור</h2>
         <p className="mb-3 text-muted">
           כמה לאט או מהר המערכת מקריאה לילד/ה. לילדים שזקוקים לזמן עיבוד שמיעתי ארוך יותר — כדאי להאט.
