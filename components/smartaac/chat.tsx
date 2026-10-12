@@ -250,6 +250,10 @@ export function VoiceAssistantView({
   const setSpeechHint = (note: string): void => {
     if (note) console.info("smartaac:", note);
   };
+  // What the child does see when a recording didn't turn into text — short
+  // and friendly, never technical (the details go to the console above).
+  const [speechProblem, setSpeechProblem] = useState("");
+  const COULD_NOT_HEAR = "😕 לא הצלחתי לשמוע. אפשר לנסות שוב, או לכתוב.";
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -569,6 +573,8 @@ export function VoiceAssistantView({
             const response = await fetch("/api/speech-to-text", {
               method: "POST",
               body: formData,
+              // a slow or filtered network: don't keep the child waiting
+              signal: AbortSignal.timeout(20000),
             });
             const data = (await response.json()) as {
               text?: string;
@@ -577,6 +583,7 @@ export function VoiceAssistantView({
             };
 
             if (!response.ok || !data.text?.trim()) {
+              setSpeechProblem(COULD_NOT_HEAR);
               const combined = `${data.error ?? ""} ${data.detail ?? ""}`;
               if (isOpenAiQuotaError(combined)) {
                 setSpeechHint(`${openAiQuotaMessage}, ורעננ/י את הדף. אפשר גם לכתוב את המשפט.`);
@@ -587,8 +594,10 @@ export function VoiceAssistantView({
             }
 
             setMessage(data.text);
+            setSpeechProblem("");
             setSpeechHint("בדק/י את הטקסט, תקנ/י אם צריך, ולחצ/י שלח.");
           } catch {
+            setSpeechProblem(COULD_NOT_HEAR);
             setSpeechHint("שגיאה בשליחת הדיבור. נס/י לכתוב וללחוץ שלח.");
           } finally {
             setIsTranscribing(false);
@@ -597,9 +606,11 @@ export function VoiceAssistantView({
       };
 
       recorder.start(250);
+      setSpeechProblem("");
       setIsRecording(true);
       setSpeechHint("מקליט... דבר/י, ואז לחצ/י סיום דיבור");
     } catch {
+      setSpeechProblem("🎤 צריך לאשר את המיקרופון בדפדפן, או לכתוב.");
       setSpeechHint("מיקרופון לא מאושר");
     }
   };
@@ -669,7 +680,10 @@ export function VoiceAssistantView({
             <textarea
               className="min-h-36 w-full rounded-2xl border border-slate-200 p-4 text-xl"
               value={message}
-              onChange={(event) => setMessage(event.target.value)}
+              onChange={(event) => {
+                setMessage(event.target.value);
+                setSpeechProblem("");
+              }}
               placeholder={isTranscribing ? "" : "אפשר לכתוב כאן או להקליט במיקרופון"}
               disabled={isTranscribing}
             />
@@ -684,6 +698,9 @@ export function VoiceAssistantView({
               </div>
             )}
           </div>
+          {speechProblem && !isTranscribing && (
+            <p className="mt-2 rounded-2xl bg-amber-50 px-4 py-2 text-lg font-bold text-amber-900">{speechProblem}</p>
+          )}
           <div className="mt-4 flex flex-wrap gap-3">
             <button
               type="button"
