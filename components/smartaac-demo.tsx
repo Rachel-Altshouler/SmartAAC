@@ -2755,8 +2755,9 @@ export function SmartAACDemo() {
             <div className="mb-4 inline-flex rounded-full bg-white/80 px-4 py-1.5 text-sm font-bold text-blue-700 shadow-sm ring-1 ring-blue-100">
               SmartAAC · תקשורת תומכת וחליפית (תת״ח)
             </div>
-            <h1 className="mx-auto max-w-3xl bg-gradient-to-l from-blue-700 via-indigo-600 to-violet-600 bg-clip-text text-3xl font-bold leading-snug tracking-tight text-transparent md:text-5xl md:leading-snug">
-              מערכת להעשרת השפה והתקשורת לילדים עם צרכים מיוחדים
+            <h1 className="mx-auto max-w-3xl bg-gradient-to-l from-blue-700 via-indigo-600 to-violet-600 bg-clip-text text-2xl font-bold leading-snug tracking-tight text-transparent md:text-4xl md:leading-snug">
+              SmartAAC – מערכת דיגיטלית המיועדת לילדים עם קשיי דיבור ומוגבלויות תקשורתיות, בשילוב ממשק מעקב להורים ולצוות
+              החינוכי.
             </h1>
           </div>
 

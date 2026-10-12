@@ -3,7 +3,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "SmartAAC",
-  description: "AAC communication app for children",
+  description:
+    "SmartAAC – מערכת דיגיטלית המיועדת לילדים עם קשיי דיבור ומוגבלויות תקשורתיות, בשילוב ממשק מעקב להורים ולצוות החינוכי.",
   manifest: "/manifest.webmanifest",
 };
 
