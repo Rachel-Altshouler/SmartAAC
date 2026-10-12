@@ -3267,6 +3267,16 @@ function LoginModal({
   onCodeLogin: () => void;
 }) {
   const [isForgotOpen, setIsForgotOpen] = useState(false);
+  const [pressedGoogle, setPressedGoogle] = useState(false);
+  useEffect(() => {
+    if (!isLoading) setPressedGoogle(false);
+  }, [isLoading]);
+  const pressGoogle = (): void => {
+    setPressedGoogle(true);
+    onGoogle();
+  };
+  const googleBusy = isLoading && pressedGoogle;
+  const formBusy = isLoading && !pressedGoogle;
   const screenTabs = supabaseReady && (
     <div className="mb-4 grid grid-cols-2 gap-1 rounded-2xl bg-slate-100 p-1">
       {(
@@ -3370,13 +3380,13 @@ function LoginModal({
               onClick={onCodeLogin}
               disabled={isLoading}
             >
-              {isLoading ? "מתחבר..." : "כניסה"}
+              {formBusy ? "מתחבר..." : "כניסה"}
             </button>
             {/* whoever signed up with Google has no password: the child's code + Google */}
             <button
               type="button"
               className="mt-3 flex w-full items-center justify-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 font-black shadow-sm"
-              onClick={onGoogle}
+              onClick={pressGoogle}
               disabled={isLoading}
             >
               <svg className="h-5 w-5 shrink-0" viewBox="0 0 48 48" aria-hidden="true">
@@ -3385,7 +3395,7 @@ function LoginModal({
                 <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
                 <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
               </svg>
-              כניסה עם Google
+              {googleBusy ? "פותח את Google..." : "כניסה עם Google"}
             </button>
             <p className="mt-3 text-center text-sm text-muted">
               עוד אין לך חשבון?{" "}
@@ -3484,7 +3494,7 @@ function LoginModal({
         <button
           type="button"
           className="mb-4 flex w-full items-center justify-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 font-black shadow-sm"
-          onClick={onGoogle}
+          onClick={pressGoogle}
           disabled={isLoading}
         >
           {/* The standard multicolor Google "G", as Google's sign-in branding asks. */}
@@ -3506,7 +3516,7 @@ function LoginModal({
               d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
             />
           </svg>
-          {isLoading ? "פותח Google..." : "התחברות עם Google"}
+          {googleBusy ? "פותח את Google..." : "התחברות עם Google"}
         </button>
         <div className="mb-3 grid gap-3">
           <label className="grid gap-1">
@@ -3591,7 +3601,7 @@ function LoginModal({
             onClick={onSubmit}
             disabled={isLoading}
           >
-            {isLoading
+            {formBusy
               ? "מתחבר..."
               : supabaseReady
                 ? accountType === "create"
