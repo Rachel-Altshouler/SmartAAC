@@ -4272,6 +4272,9 @@ function SentenceCard({
   );
 }
 
+// Always shown at the top of the child's events screen.
+const EVENT_CORE_SYMBOL_IDS = ["i", "want", "more", "yes", "no", "help", "stop", "done"];
+
 function ChildEventsView({
   eventsThisWeek,
   activeTopic,
@@ -4365,6 +4368,11 @@ function ChildEventsView({
     return { symbols, extraWords: result?.extraWords ?? [] };
   };
 
+  // Hidden symbols are already left out of allSymbols.
+  const eventCoreSymbols = EVENT_CORE_SYMBOL_IDS.map((id) => symbolById[id]).filter(
+    (symbol): symbol is AacSymbol => Boolean(symbol),
+  );
+
   const symbolByLabel = useMemo(() => {
     const map = new Map<string, AacSymbol>();
     allSymbols.forEach((symbol) => {
@@ -4388,6 +4396,25 @@ function ChildEventsView({
           <p className="text-muted">לכל אירוע יש סמלים משלו. לוחצים על סמלים כדי לדבר על האירוע.</p>
         </div>
       </div>
+
+      {/* Core words are always here, whatever the events: "אני רוצה עוד",
+          "די", "עזרה" go with any event (and with none). */}
+      {eventCoreSymbols.length > 0 && (
+        <section className="mb-4 shrink-0 rounded-[1.5rem] border border-amber-200 bg-amber-50/70 p-3">
+          <div className="grid grid-cols-4 gap-2 sm:grid-cols-8">
+            {eventCoreSymbols.map((symbol) => (
+              <SymbolTile
+                key={`event-core-${symbol.id}`}
+                symbol={symbol}
+                imageUrl={resolveSymbolImage(symbol, symbolImages)}
+                className="min-h-20"
+                variant="home"
+                onClick={() => onSymbolClick(symbol.id)}
+              />
+            ))}
+          </div>
+        </section>
+      )}
 
       {activeTopic && (
         <button
