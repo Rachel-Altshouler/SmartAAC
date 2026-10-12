@@ -16,7 +16,6 @@ export const DASHBOARD_SCREENS = {
   overview: "",
   events: "events",
   topic: "topic",
-  level: "level",
   symbols: "symbols",
   daily: "today",
   print: "print",

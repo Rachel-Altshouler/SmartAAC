@@ -103,8 +103,13 @@ npm run dev                    # http://localhost:3000
 ### מבנה
 
 ```
-app/          עמודים ו-API (auth, child-data, daily-story, shared-boards ...)
-components/   המסכים — smartaac-demo.tsx (הלוח והדשבורד), daily-story, print-symbols, shared-library
+app/          עמודים ו-API — / , /child/... , /dashboard/... (כתובת לכל מסך), auth, child-data ...
+components/
+  smartaac-demo.tsx   הלב: מידע הילד/ה, סנכרון עם Supabase, כניסה, כתובות המסכים
+  smartaac/           מסך לכל קובץ — child-board, keyboard, child-events, chat, story-game,
+                      dashboard, dashboard-events, dashboard-topic, dashboard-symbols,
+                      dashboard-progress, child-settings, login, shared (רכיבים משותפים)
+  daily-story, print-symbols, shared-library, child-device
 lib/          AI, אימות, נתוני סמלים, Supabase
 supabase/     schema.sql + migrations
 docs/         ה-QR לאתר
