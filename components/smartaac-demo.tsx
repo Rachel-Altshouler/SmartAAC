@@ -66,11 +66,20 @@ type ChildView =
 const TYPED_TOKEN_PREFIX = "typed:";
 const MAX_TYPED_CHARS = 80;
 
+// The standard Israeli computer keyboard, left to right, so a child who knows
+// the classroom keyboard finds every letter in the same place. Every row is
+// 10 keys in one grid, so keys line up one above the other ("," sits next to
+// the space bar).
 const hebrewKeyboardRows = [
-  ["ק", "ר", "א", "ט", "ו", "ן", "ם", "פ"],
+  ["/", "'", "ק", "ר", "א", "ט", "ו", "ן", "ם", "פ"],
   ["ש", "ד", "ג", "כ", "ע", "י", "ח", "ל", "ך", "ף"],
-  ["ז", "ס", "ב", "ה", "נ", "מ", "צ", "ת", "ץ"],
+  ["ז", "ס", "ב", "ה", "נ", "מ", "צ", "ת", "ץ", "."],
 ] as const;
+
+const keyboardPunctuation = new Set(["/", "'", ",", "."]);
+
+const keyboardKeyClass =
+  "min-h-12 min-w-0 rounded-xl border-2 border-slate-900 text-xl font-black text-slate-950 shadow-sm active:scale-95 sm:min-h-14 sm:text-2xl";
 
 // Dictionary used for live word prediction while typing on the letter keyboard.
 const keyboardWordDictionary = Array.from(new Set(symbols.map((symbol) => symbol.label)));
@@ -4124,50 +4133,50 @@ function KeyboardView({
           </button>
         </div>
 
-        <div className="space-y-1.5 rounded-2xl bg-slate-950 p-2" dir="rtl">
-          {/* Numbers left to right, as on any keyboard; a different color from the letters. */}
-          <div className="flex justify-center gap-1" dir="ltr">
-            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map((digit) => (
-              <button
-                key={digit}
-                type="button"
-                className="min-h-12 min-w-0 flex-1 rounded-xl border-2 border-slate-900 bg-amber-100 text-xl font-black text-slate-950 shadow-sm active:scale-95 sm:min-h-14 sm:text-2xl"
-                onClick={() => appendLetter(digit)}
-              >
-                {digit}
-              </button>
-            ))}
-          </div>
-          {hebrewKeyboardRows.map((row) => (
-            <div key={row.join("")} className="flex justify-center gap-1">
-              {row.map((letter) => (
-                <button
-                  key={letter}
-                  type="button"
-                  className="min-h-12 min-w-0 flex-1 rounded-xl border-2 border-slate-900 bg-sky-100 text-xl font-black text-slate-950 shadow-sm active:scale-95 sm:min-h-14 sm:text-2xl"
-                  onClick={() => appendLetter(letter)}
-                >
-                  {letter}
-                </button>
-              ))}
-            </div>
+        {/* Laid out left to right like a physical keyboard (the page itself is RTL). */}
+        <div className="grid grid-cols-10 gap-1 rounded-2xl bg-slate-950 p-2" dir="ltr">
+          {/* Numbers in a different color from the letters. */}
+          {["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map((digit) => (
+            <button
+              key={digit}
+              type="button"
+              className={`${keyboardKeyClass} bg-amber-100`}
+              onClick={() => appendLetter(digit)}
+            >
+              {digit}
+            </button>
           ))}
-          <div className="flex gap-1">
+          {hebrewKeyboardRows.flat().map((letter) => (
             <button
+              key={letter}
               type="button"
-              className="min-h-12 flex-[2] rounded-xl border-2 border-slate-900 bg-white text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
-              onClick={() => appendLetter(" ")}
+              className={`${keyboardKeyClass} ${keyboardPunctuation.has(letter) ? "bg-slate-200" : "bg-sky-100"}`}
+              onClick={() => appendLetter(letter)}
             >
-              רווח
+              {letter}
             </button>
-            <button
-              type="button"
-              className="min-h-12 flex-1 rounded-xl border-2 border-slate-900 bg-amber-200 text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
-              onClick={() => setDraft((current) => current.slice(0, -1))}
-            >
-              ⌫
-            </button>
-          </div>
+          ))}
+          <button
+            type="button"
+            className={`${keyboardKeyClass} bg-slate-200`}
+            onClick={() => appendLetter(",")}
+          >
+            ,
+          </button>
+          <button
+            type="button"
+            className="col-span-6 min-h-12 rounded-xl border-2 border-slate-900 bg-white text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
+            onClick={() => appendLetter(" ")}
+          >
+            רווח
+          </button>
+          <button
+            type="button"
+            className="col-span-3 min-h-12 rounded-xl border-2 border-slate-900 bg-amber-200 text-lg font-black shadow-sm active:scale-95 sm:min-h-14"
+            onClick={() => setDraft((current) => current.slice(0, -1))}
+          >
+            ⌫
+          </button>
         </div>
       </div>
     </div>
