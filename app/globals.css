@@ -34,3 +34,23 @@ select {
 button {
   -webkit-tap-highlight-color: transparent;
 }
+
+/* Keyboard users always see where they are (WCAG 2.4.7). */
+:focus-visible {
+  outline: 3px solid #2563eb;
+  outline-offset: 2px;
+  border-radius: 0.75rem;
+}
+
+/* For users who asked their device for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+

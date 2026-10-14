@@ -13,7 +13,7 @@ const config: Config = {
       },
       colors: {
         ink: "#233043",
-        muted: "#637083",
+        muted: "#566375", // 4.5:1+ contrast even on the light tinted cards (WCAG AA)
         mist: "#edf3f8",
       },
       boxShadow: {

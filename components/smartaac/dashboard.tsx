@@ -23,6 +23,17 @@ import { ProgressDashboard } from "@/components/smartaac/dashboard-progress";
 import { SymbolsDashboard } from "@/components/smartaac/dashboard-symbols";
 import { TopicDashboard } from "@/components/smartaac/dashboard-topic";
 
+const DASHBOARD_NAV = [
+  ["overview", "📊", "סקירה"],
+  ["events", "📅", "אירועים ולוח שנה"],
+  ["topic", "📚", "נושא שבועי והגדרות"],
+  ["symbols", "🔣", "סמלים"],
+  ["daily", "📸", "מה עשינו היום"],
+  ["print", "🖨️", "הדפסת סמלים"],
+  ["library", "🌍", "ספרייה משותפת"],
+  ["progress", "📈", "התקדמות"],
+] as const;
+
 export function Dashboard({
   view,
   state,
@@ -66,6 +77,7 @@ export function Dashboard({
   holidayEvents: CalendarEvent[];
   onClose: () => void;
 }) {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [codeMessage, setCodeMessage] = useState("");
   const [childPhotoError, setChildPhotoError] = useState("");
   const [isRotatingCode, setIsRotatingCode] = useState(false);
@@ -91,30 +103,53 @@ export function Dashboard({
     onStateChange(updater(state));
   };
 
+  const currentNav = DASHBOARD_NAV.find(([id]) => id === view) ?? DASHBOARD_NAV[0];
+
   return (
-    <main className="flex h-screen overflow-hidden">
-      <aside className="flex w-64 shrink-0 flex-col gap-2 overflow-y-auto border-l border-slate-200 bg-white p-4">
-        <div className="mb-4 px-2 text-2xl font-black">🧩 SmartAAC</div>
-        {[
-          ["overview", "📊", "סקירה"],
-          ["events", "📅", "אירועים ולוח שנה"],
-          ["topic", "📚", "נושא שבועי והגדרות"],
-          ["symbols", "🔣", "סמלים"],
-          ["daily", "📸", "מה עשינו היום"],
-          ["print", "🖨️", "הדפסת סמלים"],
-          ["library", "🌍", "ספרייה משותפת"],
-          ["progress", "📈", "התקדמות"],
-        ].map(([id, emoji, label]) => (
+    <main className="flex h-screen flex-col overflow-hidden md:flex-row">
+      {/* Phones: a top bar with a menu button instead of the side menu. */}
+      <div className="flex shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 md:hidden">
+        <button
+          type="button"
+          className="grid h-11 w-11 place-items-center rounded-xl border border-slate-200 text-xl"
+          aria-label={isMenuOpen ? "סגירת התפריט" : "פתיחת התפריט"}
+          aria-expanded={isMenuOpen}
+          aria-controls="dashboard-menu"
+          onClick={() => setIsMenuOpen((open) => !open)}
+        >
+          <span aria-hidden>{isMenuOpen ? "✕" : "☰"}</span>
+        </button>
+        <span className="font-black">
+          <span aria-hidden>{currentNav[1]} </span>
+          {currentNav[2]}
+        </span>
+        <span className="mr-auto text-lg font-black">🧩 SmartAAC</span>
+      </div>
+
+      <aside
+        id="dashboard-menu"
+        aria-label="תפריט הדשבורד"
+        className={cx(
+          "flex-col gap-2 overflow-y-auto border-l border-slate-200 bg-white p-4 md:flex md:w-64 md:shrink-0",
+          isMenuOpen ? "fixed inset-x-0 bottom-0 top-[4.25rem] z-40 flex" : "hidden",
+        )}
+      >
+        <div className="mb-4 hidden px-2 text-2xl font-black md:block">🧩 SmartAAC</div>
+        {DASHBOARD_NAV.map(([id, emoji, label]) => (
           <button
             key={id}
             type="button"
             className={cx(
-              "flex items-center gap-3 rounded-2xl px-4 py-3 text-right font-black text-muted",
-              view === id && "bg-blue-50 text-blue-600",
+              "flex items-center gap-3 rounded-2xl px-4 py-3 text-right font-black text-slate-600",
+              view === id && "bg-blue-50 text-blue-700",
             )}
-            onClick={() => onViewChange(id as DashboardView)}
+            aria-current={view === id ? "page" : undefined}
+            onClick={() => {
+              onViewChange(id as DashboardView);
+              setIsMenuOpen(false);
+            }}
           >
-            <span>{emoji}</span>
+            <span aria-hidden>{emoji}</span>
             <span>{label}</span>
           </button>
         ))}
@@ -129,7 +164,7 @@ export function Dashboard({
         <LegalFooterLinks className="justify-start px-2 text-[11px] text-muted" />
       </aside>
 
-      <section className="flex-1 overflow-auto p-8">
+      <section className="min-h-0 flex-1 overflow-auto p-4 sm:p-6 md:p-8">
         {view === "overview" && (
           <section className="font-rubik">
             {/* hero: who the dashboard is about */}

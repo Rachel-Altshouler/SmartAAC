@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 
-import { completeAuthSetup } from "@/lib/auth-setup";
+import { completeAuthSetup, listAccountChildren } from "@/lib/auth-setup";
 
 import {
+
+  createAuthedSupabaseClient,
 
   exchangeOAuthCode,
 
@@ -153,8 +155,14 @@ export async function POST(request: Request): Promise<NextResponse> {
 
 
     // Joining / signing in with Google: the child's code is asked for after
-    // Google, so the first round comes without one.
-    if (accountType === "join" && !body.childAccessCode?.trim()) {
+    // Google, so the first round comes without one. "New child profile" with
+    // a Google account that already works with a child is a sign-in too — it
+    // asks for the code as well, instead of opening that child silently.
+    const isReturningCreate =
+      accountType === "create" &&
+      (await listAccountChildren(createAuthedSupabaseClient(exchanged.session.access_token), exchanged.session.user.id))
+        .length > 0;
+    if ((accountType === "join" && !body.childAccessCode?.trim()) || isReturningCreate) {
       return NextResponse.json(
         {
           needCode: true,

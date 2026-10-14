@@ -121,7 +121,9 @@ const readAuthDraft = (): AuthDraft => {
   }
   return {
     mode: "parent",
-    accountType: "create",
+    // No draft (e.g. Google came back to another tab or address): a sign-in
+    // that asks for the child's code — never a silent entry or a new child.
+    accountType: "join",
     name: "הורה",
     email: "",
     childName: "דניאל",
@@ -2169,7 +2171,7 @@ export function SmartAACDemo() {
         </section>
 
         {googleCodeStep && (
-          <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+          <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5" role="dialog" aria-modal="true" aria-label="קוד הילד/ה אחרי Google">
             <div className="flex min-h-full justify-center">
               <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
                 <div className="mb-4 rounded-2xl bg-blue-50 p-4">
@@ -2285,43 +2287,43 @@ export function SmartAACDemo() {
         onClick={openDashboardTrigger}
       />
 
-      <header className="mx-auto flex w-full max-w-7xl gap-3 overflow-x-auto rounded-t-[2rem] border border-white bg-white/90 p-3 shadow-soft backdrop-blur">
+      <header className="mx-auto flex w-full max-w-7xl flex-wrap justify-center gap-2 rounded-t-[2rem] border border-white bg-white/90 p-2 shadow-soft backdrop-blur sm:flex-nowrap sm:justify-start sm:gap-3 sm:overflow-x-auto sm:p-3">
         <button
           type="button"
-          className="min-w-20 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-black text-white shadow-sm"
+          className="min-h-14 min-w-14 rounded-2xl bg-slate-900 px-3 py-2 text-sm font-black text-white shadow-sm sm:min-w-20 sm:px-4 sm:py-3"
           onClick={() => (isChildDevice ? setChildView({ type: "home" }) : setIsEntryOpen(true))}
         >
           בית
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl border-2 border-red-200 bg-red-50 text-center font-black text-red-800 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl border-2 border-red-200 bg-red-50 text-center font-black text-red-800 shadow-sm"
           onClick={() => setSentence((current) => current.slice(0, -1))}
           aria-label="מחק סמל אחרון"
           title="מחיקת מילה"
         >
-          <span className="block text-2xl">⌫</span>
-          <span className="block text-xs">מילה</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>⌫</span>
+          <span className="block text-[11px] sm:text-xs">מילה</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl border-2 border-red-300 bg-red-100 text-center font-black text-red-900 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl border-2 border-red-300 bg-red-100 text-center font-black text-red-900 shadow-sm"
           onClick={() => setSentence([])}
           aria-label="מחק משפט"
           title="מחיקת משפט"
         >
-          <span className="block text-2xl">🗑️</span>
-          <span className="block text-xs">משפט</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>🗑️</span>
+          <span className="block text-[11px] sm:text-xs">משפט</span>
         </button>
 
         <div
           className={cx(
-            "flex min-h-20 flex-1 items-center gap-2 overflow-x-auto rounded-[1.5rem] border-4 border-blue-200 bg-gradient-to-l from-white to-blue-50 p-3 shadow-inner",
+            "order-first flex min-h-16 w-full basis-full items-center gap-2 overflow-x-auto rounded-[1.5rem] border-4 border-blue-200 bg-gradient-to-l from-white to-blue-50 p-2 shadow-inner sm:order-none sm:min-h-20 sm:w-auto sm:flex-1 sm:basis-auto sm:p-3",
             sentence.length === 0 && "text-muted",
           )}
         >
           {sentence.length === 0 ? (
-            <span className="px-3 text-2xl font-black text-slate-400">
+            <span className="px-3 text-lg font-black text-slate-500 sm:text-2xl">
               בנה משפט בעזרת הסמלים...
             </span>
           ) : (
@@ -2352,7 +2354,7 @@ export function SmartAACDemo() {
                       )}
                     />
                   ) : (
-                    <span className="block text-2xl">
+                    <span className="block text-xl sm:text-2xl" aria-hidden>
                       {symbol?.emoji ?? typedEmoji[label.replace(/[?!.,]+$/, "")] ?? "⌨️"}
                     </span>
                   )}
@@ -2365,68 +2367,68 @@ export function SmartAACDemo() {
 
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-blue-600 text-center font-black text-white shadow-soft"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-blue-600 text-center font-black text-white shadow-soft"
           onClick={() => void speakSentence()}
           aria-label="הקרא משפט"
           title="הקראה"
         >
-          <span className="block text-2xl">🔊</span>
-          <span className="block text-xs">הקרא</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>🔊</span>
+          <span className="block text-[11px] sm:text-xs">הקרא</span>
         </button>
 
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-sky-300 text-center font-black text-sky-950 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-sky-300 text-center font-black text-sky-950 shadow-sm"
           onClick={() => setChildView({ type: "keyboard" })}
           aria-label="מקלדת להקלדה"
           title="מקלדת"
         >
-          <span className="block text-2xl">⌨️</span>
-          <span className="block text-xs">מקלדת</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>⌨️</span>
+          <span className="block text-[11px] sm:text-xs">מקלדת</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-violet-300 text-center font-black text-violet-950 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-violet-300 text-center font-black text-violet-950 shadow-sm"
           onClick={() => setChildView({ type: "events" })}
           aria-label="לוח אירועים"
           title="לוח אירועים"
         >
-          <span className="block text-2xl">🗓️</span>
-          <span className="block text-xs">אירועים</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>🗓️</span>
+          <span className="block text-[11px] sm:text-xs">אירועים</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-emerald-300 text-center font-black text-emerald-950 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-emerald-300 text-center font-black text-emerald-950 shadow-sm"
           onClick={() => setChildView({ type: "assistant" })}
           aria-label="שיחה חכמה"
           title="שיחה חכמה"
         >
-          <span className="block text-2xl">🗣️</span>
-          <span className="block text-xs">שיחה</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>🗣️</span>
+          <span className="block text-[11px] sm:text-xs">שיחה</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-rose-300 text-center font-black text-rose-950 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-rose-300 text-center font-black text-rose-950 shadow-sm"
           onClick={() => setChildView({ type: "story" })}
           aria-label="בואו נספר סיפור"
           title="סיפור"
         >
-          <span className="block text-2xl">📖</span>
-          <span className="block text-xs">סיפור</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>📖</span>
+          <span className="block text-[11px] sm:text-xs">סיפור</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-20 shrink-0 place-items-center rounded-2xl bg-amber-300 text-center font-black text-amber-950 shadow-sm"
+          className="grid min-h-14 w-14 shrink-0 sm:min-h-20 sm:w-20 place-items-center rounded-2xl bg-amber-300 text-center font-black text-amber-950 shadow-sm"
           onClick={() => setChildView({ type: "daily" })}
           aria-label="מה עשיתי היום"
           title="מה עשיתי היום — בבית ובבית הספר"
         >
-          <span className="block text-2xl">📸</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>📸</span>
           <span className="block text-xs leading-tight">מה עשיתי היום</span>
         </button>
         <button
           type="button"
-          className="grid min-h-20 w-24 shrink-0 place-items-center rounded-2xl border-2 border-slate-300 bg-white px-1 text-center font-black text-slate-700 shadow-sm"
+          className="grid min-h-14 w-16 shrink-0 sm:min-h-20 sm:w-24 place-items-center rounded-2xl border-2 border-slate-300 bg-white px-1 text-center font-black text-slate-700 shadow-sm"
           onClick={() => {
             // On the child's own device the parent PIN guards the dashboard;
             // elsewhere this is the regular parent/teacher sign-in.
@@ -2440,7 +2442,7 @@ export function SmartAACDemo() {
           aria-label="חזרה למסך הורה / מורה"
           title="חזרה למסך הורה / מורה"
         >
-          <span className="block text-2xl">🔒</span>
+          <span className="block text-xl sm:text-2xl" aria-hidden>🔒</span>
           <span className="block text-[11px] leading-tight">מסך הורה / מורה</span>
         </button>
       </header>

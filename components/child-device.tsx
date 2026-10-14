@@ -93,6 +93,15 @@ export function ParentPinModal({
 
   const isLocked = lockedUntil > now;
 
+  // Escape closes the PIN window.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
   useEffect(() => {
     if (!isLocked) return;
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
@@ -126,7 +135,7 @@ export function ParentPinModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-4" dir="rtl">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-4" dir="rtl" role="dialog" aria-modal="true" aria-label="כניסת הורה / מטפל">
       <div className="w-full max-w-xs rounded-[2rem] bg-white p-6 text-center shadow-soft">
         <div className="text-4xl">🔒</div>
         <h2 className="mt-2 text-2xl font-black">כניסת הורה / מטפל</h2>

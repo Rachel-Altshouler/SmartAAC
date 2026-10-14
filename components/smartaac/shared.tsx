@@ -256,7 +256,8 @@ export function SymbolTile({
       {imageUrl || symbol.pictogramId ? (
         <img
           src={imageUrl || arasaacImageUrl(symbol.pictogramId as number)}
-          alt={symbol.label}
+          // the word is written right under the picture: empty alt avoids reading it twice
+          alt=""
           className={cx(
             "mx-auto object-cover",
             imageUrl ? "rounded-full" : "rounded-md",

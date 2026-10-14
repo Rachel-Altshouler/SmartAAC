@@ -65,6 +65,14 @@ export function LoginModal({
   useEffect(() => {
     if (!isLoading) setPressedGoogle(false);
   }, [isLoading]);
+  // Escape closes the sign-in window, like any dialog.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
   const pressGoogle = (): void => {
     setPressedGoogle(true);
     onGoogle();
@@ -96,7 +104,7 @@ export function LoginModal({
 
   if (supabaseReady && authScreen === "login") {
     return (
-      <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+      <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5" role="dialog" aria-modal="true" aria-label={authScreen === "login" ? "כניסה" : "הרשמה"}>
         <div className="flex min-h-full justify-center">
           <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
             {screenTabs}
@@ -211,7 +219,7 @@ export function LoginModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5">
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/45 p-5" role="dialog" aria-modal="true" aria-label={authScreen === "login" ? "כניסה" : "הרשמה"}>
       <div className="flex min-h-full justify-center">
         <div className="my-auto w-full max-w-md rounded-soft bg-white p-6 shadow-soft">
         {screenTabs}

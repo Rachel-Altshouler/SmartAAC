@@ -94,9 +94,11 @@ function KeshetRow({
         )}
         <span className="mt-1 text-xs leading-tight sm:text-sm">{label}</span>
       </div>
-      <div className="flex min-w-0 flex-1 gap-1.5">
+      {/* Phones: a 3-column grid, so tiles stay big enough to read and tap.
+          Wider screens: the whole row on one line, as on a tablet board. */}
+      <div className="grid min-w-0 flex-1 grid-cols-3 gap-1.5 sm:flex">
         {showNameCell && childName ? (
-          <div className="flex min-w-[5rem] shrink-0 flex-col items-center justify-center rounded-xl border-[3px] border-slate-900 bg-violet-200 px-2 py-1 text-center font-black shadow-sm sm:min-w-[6rem]">
+          <div className="flex min-w-0 shrink-0 flex-col items-center justify-center rounded-xl border-[3px] border-slate-900 bg-violet-200 px-2 py-1 text-center font-black shadow-sm sm:min-w-[6rem]">
             {symbolImages[CHILD_PHOTO_KEY] ? (
               <img
                 src={symbolImages[CHILD_PHOTO_KEY]}
@@ -123,7 +125,7 @@ function KeshetRow({
           <div
             key={`empty-slot-${index}`}
             // Same border + padding as a tile, so flex gives every slot the exact same width.
-            className="min-w-0 flex-1 border-[3px] border-transparent p-1 sm:p-1.5"
+            className="hidden min-w-0 flex-1 border-[3px] border-transparent p-1 sm:block sm:p-1.5"
             aria-hidden
           />
         ))}

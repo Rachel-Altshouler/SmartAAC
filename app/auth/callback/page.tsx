@@ -35,7 +35,9 @@ const readAuthDraft = (): AuthDraft => {
   }
   return {
     mode: "parent",
-    accountType: "create",
+    // No draft (e.g. Google came back to another tab or address): a sign-in
+    // that asks for the child's code — never a silent entry or a new child.
+    accountType: "join",
     name: "הורה",
     email: "",
     childName: "דניאל",
