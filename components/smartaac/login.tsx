@@ -403,6 +403,17 @@ export function LoginModal({
                   : "הרשמה והצטרפות"
                 : "כניסה מקומית"}
           </button>
+          <p className="text-center text-xs text-muted">
+            בהרשמה אני מאשר/ת את{" "}
+            <a href="/terms" target="_blank" className="font-bold text-blue-700 underline">
+              תנאי השימוש
+            </a>{" "}
+            ואת{" "}
+            <a href="/privacy" target="_blank" className="font-bold text-blue-700 underline">
+              מדיניות הפרטיות
+            </a>
+            , ושאני ההורה של הילד/ה או שיש לי את הסכמת ההורה.
+          </p>
           <div className="flex flex-wrap justify-end gap-3">
             {!supabaseReady && accountType === "create" && (
               <button

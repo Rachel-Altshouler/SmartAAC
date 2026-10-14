@@ -19,6 +19,7 @@ import { ChildDailyStoryView, prefetchDailyStory } from "@/components/daily-stor
 import { isChildDeviceEnabled, ParentPinModal } from "@/components/child-device";
 import { buildTeacherInviteContent } from "@/lib/teacher-invite";
 import { pathToScreen, screenToPath, type Screen } from "@/lib/screen-routes";
+import { LegalFooterLinks } from "@/components/legal-page";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase-browser";
 import {
   sanitizeTypedText,
@@ -2164,6 +2165,7 @@ export function SmartAACDemo() {
               </span>
             </button>
           </div>
+          <LegalFooterLinks className="mt-8 text-sm text-slate-500" />
         </section>
 
         {googleCodeStep && (

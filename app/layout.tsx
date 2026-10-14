@@ -1,11 +1,23 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
+const description =
+  "SmartAAC – מערכת דיגיטלית המיועדת לילדים עם קשיי דיבור ומוגבלויות תקשורתיות, בשילוב ממשק מעקב להורים ולצוות החינוכי.";
+
 export const metadata: Metadata = {
+  metadataBase: new URL("https://smart-aac.vercel.app"),
   title: "SmartAAC",
-  description:
-    "SmartAAC – מערכת דיגיטלית המיועדת לילדים עם קשיי דיבור ומוגבלויות תקשורתיות, בשילוב ממשק מעקב להורים ולצוות החינוכי.",
+  description,
   manifest: "/manifest.webmanifest",
+  // How a shared link looks in WhatsApp, Facebook, etc.
+  openGraph: {
+    title: "SmartAAC",
+    description,
+    url: "/",
+    siteName: "SmartAAC",
+    locale: "he_IL",
+    type: "website",
+  },
 };
 
 export const viewport: Viewport = {

@@ -7,6 +7,7 @@ import { SharedLibraryDashboard } from "@/components/shared-library";
 import { DailyStoryDashboard } from "@/components/daily-story";
 import { PrintSymbolsDashboard } from "@/components/print-symbols";
 import { ChildDevicePanel } from "@/components/child-device";
+import { LegalFooterLinks } from "@/components/legal-page";
 import {
   type DashboardView,
   eventInfo,
@@ -125,6 +126,7 @@ export function Dashboard({
           סמלי התקשורת: ARASAAC (arasaac.org), מאת Sergio Palao, בבעלות ממשלת
           אראגון, ברישיון CC BY-NC-SA.
         </p>
+        <LegalFooterLinks className="justify-start px-2 text-[11px] text-muted" />
       </aside>
 
       <section className="flex-1 overflow-auto p-8">

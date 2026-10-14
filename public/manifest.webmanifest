@@ -1,7 +1,7 @@
 {
   "name": "SmartAAC",
   "short_name": "SmartAAC",
-  "description": "Rule-based AAC communication demo",
+  "description": "מערכת תקשורת תומכת וחליפית (תת״ח) לילדים, עם ממשק מעקב להורים ולצוות החינוכי",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#edf3f8",
